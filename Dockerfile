@@ -39,7 +39,7 @@ RUN npm run build
 #    behind a load balancer, all pointed at the same Postgres/Redis/object
 #    storage — see docker-compose.yml.
 # ---------------------------------------------------------------------------
-FROM php:8.3-fpm-alpine AS runtime
+FROM php:8.4-fpm-alpine AS runtime
 
 RUN apk add --no-cache \
         nginx \
