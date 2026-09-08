@@ -112,6 +112,7 @@ class EnrollmentController extends Controller
     }
 
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Step 2: PIN via Hardware Keypad — SSE Status Stream
     // -------------------------------------------------------------------------
 
@@ -123,6 +124,21 @@ class EnrollmentController extends Controller
         return response()->stream(function () use ($token, $timeout) {
             set_time_limit(0);
             ignore_user_abort(true);
+
+            if (function_exists('apache_setenv')) {
+                @apache_setenv('no-gzip', '1');
+            }
+            @ini_set('zlib.output_compression', '0');
+            @ini_set('implicit_flush', '1');
+
+            if (session_status() === PHP_SESSION_ACTIVE) {
+                session_write_close();
+            }
+
+            while (ob_get_level() > 0) {
+                @ob_end_flush();
+            }
+
             $start = time();
 
             $this->sseSend('status', 'Connecting to ESP32 Keypad...');
@@ -138,20 +154,26 @@ class EnrollmentController extends Controller
                             'message' => 'PIN Registered via Hardware Keypad!',
                         ]));
                     } else {
-                        $this->sseSend('error', $result['message'] ?? 'PIN entry failed.');
+                        $this->sseSend('step_error', $result['message'] ?? 'PIN entry failed.');
                     }
                     return;
                 }
 
-                ob_flush();
-                flush();
+                // Periodic comment heartbeat to keep connection alive
+                echo ": ping\n\n";
+                if (ob_get_level() > 0) {
+                    @ob_flush();
+                }
+                @flush();
+
                 sleep(1);
             }
 
-            $this->sseSend('error', 'Timeout: No PIN entered on keypad. Please try again.');
+            $this->sseSend('step_error', 'Timeout: No PIN entered on keypad. Please try again.');
         }, 200, [
             'Content-Type'      => 'text/event-stream',
-            'Cache-Control'     => 'no-cache',
+            'Cache-Control'     => 'no-cache, no-transform',
+            'Connection'        => 'keep-alive',
             'X-Accel-Buffering' => 'no',
         ]);
     }
@@ -200,6 +222,21 @@ class EnrollmentController extends Controller
         return response()->stream(function () use ($token, $timeout) {
             set_time_limit(0);
             ignore_user_abort(true);
+
+            if (function_exists('apache_setenv')) {
+                @apache_setenv('no-gzip', '1');
+            }
+            @ini_set('zlib.output_compression', '0');
+            @ini_set('implicit_flush', '1');
+
+            if (session_status() === PHP_SESSION_ACTIVE) {
+                session_write_close();
+            }
+
+            while (ob_get_level() > 0) {
+                @ob_end_flush();
+            }
+
             $start = time();
 
             $this->sseSend('status', 'Connecting to ESP32 Fingerprint Sensor...');
@@ -216,20 +253,26 @@ class EnrollmentController extends Controller
                             'fingerprint_id' => $result['fingerprint_id'],
                         ]));
                     } else {
-                        $this->sseSend('error', $result['message'] ?? 'Fingerprint enrollment failed.');
+                        $this->sseSend('step_error', $result['message'] ?? 'Fingerprint enrollment failed.');
                     }
                     return;
                 }
 
-                ob_flush();
-                flush();
+                // Periodic comment heartbeat to keep connection alive
+                echo ": ping\n\n";
+                if (ob_get_level() > 0) {
+                    @ob_flush();
+                }
+                @flush();
+
                 sleep(1);
             }
 
-            $this->sseSend('error', 'Timeout: No fingerprint detected. Please try again.');
+            $this->sseSend('step_error', 'Timeout: No fingerprint detected. Please try again.');
         }, 200, [
             'Content-Type'      => 'text/event-stream',
-            'Cache-Control'     => 'no-cache',
+            'Cache-Control'     => 'no-cache, no-transform',
+            'Connection'        => 'keep-alive',
             'X-Accel-Buffering' => 'no',
         ]);
     }
@@ -262,6 +305,21 @@ class EnrollmentController extends Controller
         return response()->stream(function () use ($token, $timeout) {
             set_time_limit(0);
             ignore_user_abort(true);
+
+            if (function_exists('apache_setenv')) {
+                @apache_setenv('no-gzip', '1');
+            }
+            @ini_set('zlib.output_compression', '0');
+            @ini_set('implicit_flush', '1');
+
+            if (session_status() === PHP_SESSION_ACTIVE) {
+                session_write_close();
+            }
+
+            while (ob_get_level() > 0) {
+                @ob_end_flush();
+            }
+
             $start = time();
 
             $this->sseSend('status', 'Connecting to ESP32 RFID Reader...');
@@ -278,20 +336,26 @@ class EnrollmentController extends Controller
                             'rfid_uid' => $result['rfid_uid'],
                         ]));
                     } else {
-                        $this->sseSend('error', $result['message'] ?? 'RFID registration failed.');
+                        $this->sseSend('step_error', $result['message'] ?? 'RFID registration failed.');
                     }
                     return;
                 }
 
-                ob_flush();
-                flush();
+                // Periodic comment heartbeat to keep connection alive
+                echo ": ping\n\n";
+                if (ob_get_level() > 0) {
+                    @ob_flush();
+                }
+                @flush();
+
                 sleep(1);
             }
 
-            $this->sseSend('error', 'Timeout: No RFID card detected. Please try again.');
+            $this->sseSend('step_error', 'Timeout: No RFID card detected. Please try again.');
         }, 200, [
             'Content-Type'      => 'text/event-stream',
-            'Cache-Control'     => 'no-cache',
+            'Cache-Control'     => 'no-cache, no-transform',
+            'Connection'        => 'keep-alive',
             'X-Accel-Buffering' => 'no',
         ]);
     }
@@ -350,5 +414,9 @@ class EnrollmentController extends Controller
     {
         echo "event: {$event}\n";
         echo "data: {$data}\n\n";
+        if (ob_get_level() > 0) {
+            @ob_flush();
+        }
+        @flush();
     }
 }

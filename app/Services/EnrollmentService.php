@@ -96,8 +96,10 @@ class EnrollmentService
         }
 
         Cache::forget("enrollment_session_{$token}");
+        Cache::forget(Esp32EnrollmentClient::pinCacheKey($token));
         Cache::forget(Esp32EnrollmentClient::fingerprintCacheKey($token));
         Cache::forget(Esp32EnrollmentClient::rfidCacheKey($token));
+        Cache::forget(Esp32EnrollmentClient::commandCacheKey($token));
     }
 
     // -------------------------------------------------------------------------
@@ -161,6 +163,9 @@ class EnrollmentService
         if (!$session) {
             throw new \RuntimeException('Invalid or expired enrollment session.');
         }
+
+        // Clear any previous attempt results for this step
+        Cache::forget(Esp32EnrollmentClient::pinCacheKey($token));
 
         $this->esp32->requestPinEnrollment($token);
 
@@ -251,6 +256,9 @@ class EnrollmentService
             throw new \RuntimeException('Invalid or expired enrollment session.');
         }
 
+        // Clear any previous attempt results for this step
+        Cache::forget(Esp32EnrollmentClient::fingerprintCacheKey($token));
+
         $this->esp32->requestFingerprintEnrollment($token);
 
         $this->log($token, $session['admin_id'], $session['user_id'],
@@ -287,6 +295,9 @@ class EnrollmentService
         if (!$session) {
             throw new \RuntimeException('Invalid or expired enrollment session.');
         }
+
+        // Clear any previous attempt results for this step
+        Cache::forget(Esp32EnrollmentClient::rfidCacheKey($token));
 
         $this->esp32->requestRfidEnrollment($token);
 

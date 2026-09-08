@@ -725,12 +725,17 @@ function enrollWizard() {
                 this.addLog('pinLog', d.message, 'ok');
                 this.pinSse.close(); this.pinSse = null;
             });
-            this.pinSse.addEventListener('error', e => {
-                if (this.pinState !== 'done') {
-                    this.pinState = 'error';
-                    this.addLog('pinLog', e.data||'Connection lost.', 'err');
-                }
+            this.pinSse.addEventListener('step_error', e => {
+                this.pinState = 'error';
+                this.addLog('pinLog', e.data, 'err');
                 this.pinSse.close(); this.pinSse = null;
+            });
+            this.pinSse.addEventListener('error', e => {
+                if (this.pinState !== 'done' && this.pinState !== 'error') {
+                    this.pinState = 'error';
+                    this.addLog('pinLog', 'Connection timed out or lost. Please click Retry.', 'err');
+                }
+                if (this.pinSse) { this.pinSse.close(); this.pinSse = null; }
             });
         },
 
@@ -775,12 +780,17 @@ function enrollWizard() {
                 this.addLog('fpLog', d.message, 'ok');
                 this.fpSse.close(); this.fpSse = null;
             });
-            this.fpSse.addEventListener('error', e => {
-                if (this.fp.state !== 'done') {
-                    this.fp.state = 'error';
-                    this.addLog('fpLog', e.data||'Connection lost.', 'err');
-                }
+            this.fpSse.addEventListener('step_error', e => {
+                this.fp.state = 'error';
+                this.addLog('fpLog', e.data, 'err');
                 this.fpSse.close(); this.fpSse = null;
+            });
+            this.fpSse.addEventListener('error', e => {
+                if (this.fp.state !== 'done' && this.fp.state !== 'error') {
+                    this.fp.state = 'error';
+                    this.addLog('fpLog', 'Connection timed out or lost. Please click Retry.', 'err');
+                }
+                if (this.fpSse) { this.fpSse.close(); this.fpSse = null; }
             });
         },
 
@@ -825,12 +835,17 @@ function enrollWizard() {
                 this.addLog('rfidLog', d.message, 'ok');
                 this.rfidSse.close(); this.rfidSse = null;
             });
-            this.rfidSse.addEventListener('error', e => {
-                if (this.rfid.state !== 'done') {
-                    this.rfid.state = 'error';
-                    this.addLog('rfidLog', e.data||'Connection lost.', 'err');
-                }
+            this.rfidSse.addEventListener('step_error', e => {
+                this.rfid.state = 'error';
+                this.addLog('rfidLog', e.data, 'err');
                 this.rfidSse.close(); this.rfidSse = null;
+            });
+            this.rfidSse.addEventListener('error', e => {
+                if (this.rfid.state !== 'done' && this.rfid.state !== 'error') {
+                    this.rfid.state = 'error';
+                    this.addLog('rfidLog', 'Connection timed out or lost. Please click Retry.', 'err');
+                }
+                if (this.rfidSse) { this.rfidSse.close(); this.rfidSse = null; }
             });
         },
 
