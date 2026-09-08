@@ -69,7 +69,7 @@ void connectWiFi();
 const char *WIFI_SSID = "Redmi Note 11";
 const char *WIFI_PASSWORD = "benben96";
 const char *SERVER_URL =
-    "http://192.168.1.100:8000"; // TRILOCK Backend Server IP
+    "http://192.168.8.153:8000"; // TRILOCK Backend Server IP
 const char *DEVICE_API_KEY =
     "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
 

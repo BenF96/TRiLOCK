@@ -121,6 +121,8 @@ class EnrollmentController extends Controller
         $timeout = (int) config('trilock.enrollment_timeout', 60);
 
         return response()->stream(function () use ($token, $timeout) {
+            set_time_limit(0);
+            ignore_user_abort(true);
             $start = time();
 
             $this->sseSend('status', 'Connecting to ESP32 Keypad...');
@@ -196,6 +198,8 @@ class EnrollmentController extends Controller
         $timeout = (int) config('trilock.enrollment_timeout', 60);
 
         return response()->stream(function () use ($token, $timeout) {
+            set_time_limit(0);
+            ignore_user_abort(true);
             $start = time();
 
             $this->sseSend('status', 'Connecting to ESP32 Fingerprint Sensor...');
@@ -256,6 +260,8 @@ class EnrollmentController extends Controller
         $timeout = (int) config('trilock.enrollment_timeout', 60);
 
         return response()->stream(function () use ($token, $timeout) {
+            set_time_limit(0);
+            ignore_user_abort(true);
             $start = time();
 
             $this->sseSend('status', 'Connecting to ESP32 RFID Reader...');

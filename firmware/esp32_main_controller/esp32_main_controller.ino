@@ -1,51 +1,53 @@
 /*
  * =====================================================================================
  * TRILOCK System - ESP32 Main Controller Firmware
- * Hardware: ESP32 Dev Module, MFRC522 RFID (SPI), Adafruit Fingerprint Sensor (UART2),
- *           Solenoid Relay, Buzzer & Status LEDs. No magnetic door contact sensor on
- *           this build (HAS_DOOR_SENSOR is 0 below).
- * Framework: Arduino / ESP32 Core
+ * Hardware: ESP32 Dev Module, MFRC522 RFID (SPI), Adafruit Fingerprint Sensor
+ * (UART2), Solenoid Relay, Buzzer & Status LEDs. No magnetic door contact
+ * sensor on this build (HAS_DOOR_SENSOR is 0 below). Framework: Arduino / ESP32
+ * Core
  * =====================================================================================
  *
  * BUZZER WIRING
  *   Passive piezo (recommended, plays tones):
  *       BUZZER_PIN (GPIO15) --[100R]-- Buzzer (+)   |   Buzzer (-) -- GND
  *   Active buzzer module (fixed internal tone, on/off only):
- *       Set BUZZER_IS_ACTIVE to 1 below, wire I/O -> GPIO15, VCC -> 5V/3V3, GND -> GND.
- *   Loud (>25mA) buzzers must be driven through an NPN transistor (e.g. 2N2222 + 1K base
- *   resistor) or a MOSFET - do not sink the coil current through the ESP32 pin directly.
+ *       Set BUZZER_IS_ACTIVE to 1 below, wire I/O -> GPIO15, VCC -> 5V/3V3, GND
+ * -> GND. Loud (>25mA) buzzers must be driven through an NPN transistor (e.g.
+ * 2N2222 + 1K base resistor) or a MOSFET - do not sink the coil current through
+ * the ESP32 pin directly.
  *
- *   Strapping pin notes (all keep their default/expected boot state on this wiring, but
- *   worth knowing if you change it further):
- *     GPIO12 (keypad Row 2, MTDI) - must read LOW at reset or the ESP32 will refuse to
- *       boot on 3.3V-flash modules (the overwhelming majority). The keypad library idles
- *       rows LOW, so this is fine as wired.
- *     GPIO15 (BUZZER_PIN, MTDO) - if held HIGH at reset, only silences the UART boot log;
- *       does not block booting. A brief chirp/pulse on power-up is normal.
- *     GPIO2 (LED_GREEN) - must not be pulled HIGH externally during boot/flashing.
+ *   Strapping pin notes (all keep their default/expected boot state on this
+ * wiring, but worth knowing if you change it further): GPIO12 (keypad Row 2,
+ * MTDI) - must read LOW at reset or the ESP32 will refuse to boot on 3.3V-flash
+ * modules (the overwhelming majority). The keypad library idles rows LOW, so
+ * this is fine as wired. GPIO15 (BUZZER_PIN, MTDO) - if held HIGH at reset,
+ * only silences the UART boot log; does not block booting. A brief chirp/pulse
+ * on power-up is normal. GPIO2 (LED_GREEN) - must not be pulled HIGH externally
+ * during boot/flashing.
  *
  * OFFLINE UNLOCK
- *   While online, this device periodically pulls the full RFID+fingerprint+PIN combo
- *   for every enrolled user from GET /api/offline-sync and caches it to flash (LittleFS).
- *   If the server is unreachable (WiFi down, or the request fails/times out), a scan that
- *   completes all three factors is checked against this local cache instead - same
- *   security bar as online (all 3 factors, one user), just verified on-device. Requires
- *   OFFLINE_PIN_SALT below to exactly match TRILOCK_OFFLINE_PIN_SALT in the server's .env.
+ *   While online, this device periodically pulls the full RFID+fingerprint+PIN
+ * combo for every enrolled user from GET /api/offline-sync and caches it to
+ * flash (LittleFS). If the server is unreachable (WiFi down, or the request
+ * fails/times out), a scan that completes all three factors is checked against
+ * this local cache instead - same security bar as online (all 3 factors, one
+ * user), just verified on-device. Requires OFFLINE_PIN_SALT below to exactly
+ * match TRILOCK_OFFLINE_PIN_SALT in the server's .env.
  * =====================================================================================
  */
 
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiServer.h>
-#include <ArduinoJson.h>
-#include <SPI.h>
-#include <MFRC522.h>
-#include <HardwareSerial.h>
 #include <Adafruit_Fingerprint.h>
-#include <Keypad.h>          // Library: "Keypad" by Mark Stanley & Alexander Brevig
-#include <esp_task_wdt.h>    // ESP32 Hardware Task Watchdog Timer
-#include <LittleFS.h>        // On-flash cache for offline credential verification
-#include <mbedtls/md.h>      // SHA-256 for offline PIN hashing (bundled with ESP32 core)
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <HardwareSerial.h>
+#include <Keypad.h>   // Library: "Keypad" by Mark Stanley & Alexander Brevig
+#include <LittleFS.h> // On-flash cache for offline credential verification
+#include <MFRC522.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <WiFiServer.h>
+#include <esp_task_wdt.h> // ESP32 Hardware Task Watchdog Timer
+#include <mbedtls/md.h> // SHA-256 for offline PIN hashing (bundled with ESP32 core)
 
 #define WDT_TIMEOUT_SECONDS 15
 
@@ -69,8 +71,10 @@ void pollEnrollmentCommand();
 void enrollPinOnKeypad(String sessionToken);
 void enrollFingerprintOnSensor(String sessionToken);
 void enrollRfidOnSensor(String sessionToken);
-void sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg = "");
-void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode = "");
+void sendEnrollmentResult(String type, String token, String status,
+                          String valueStr, int valueInt, String errMsg = "");
+void sendAccessRequest(String method, String accessType, String cardUid,
+                       int fingerprintId, String pinCode = "");
 void syncOfflineCache();
 bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode);
 String sha256Hex(String input);
@@ -82,46 +86,52 @@ void connectWiFi();
 // -------------------------------------------------------------------------------------
 // CONFIGURATION & PINS
 // -------------------------------------------------------------------------------------
-const char* WIFI_SSID      = "Redmi Note 11";
-const char* WIFI_PASSWORD  = "benben96";
-const char* SERVER_URL     = "http://10.65.130.35:8000"; // TRILOCK Backend Server IP
-const char* DEVICE_API_KEY = "trilock_dev_g0C9agNqMfjX7VQcIa6lprujxud4KvTxm0LA0WHu8x0U6P6G"; // Matches TRILOCK_DEVICE_API_KEY
+const char *WIFI_SSID = "Redmi Note 11";
+const char *WIFI_PASSWORD = "benben96";
+const char *SERVER_URL =
+    "https://trilock-lx5t.onrender.com"; // TRILOCK Backend Server IP
+const char *DEVICE_API_KEY =
+    "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
 
-// Must match TRILOCK_OFFLINE_PIN_SALT in the server's .env exactly — used to verify a
-// keypad PIN locally, without ever storing the PIN itself in plaintext on the device.
-const char* OFFLINE_PIN_SALT = "trilock_offline_salt_change_me";
+// Must match TRILOCK_OFFLINE_PIN_SALT in the server's .env exactly — used to
+// verify a keypad PIN locally, without ever storing the PIN itself in plaintext
+// on the device.
+const char *OFFLINE_PIN_SALT = "ab80053da114cdb5b40512dabcb63bbd";
 
-const int DEVICE_ID       = 4; // Device ID in TRILOCK database
+const int DEVICE_ID = 4; // Device ID in TRILOCK database
 
 // Remote unlock server: Laravel will POST /unlock to this port on the ESP32
-#define UNLOCK_SERVER_PORT  8080
-#define HTTP_TIMEOUT_MS            8000 // One-off event reports (enrollment results, door status)
+#define UNLOCK_SERVER_PORT 8080
+#define HTTP_TIMEOUT_MS                                                        \
+  8000 // One-off event reports (enrollment results, door status)
 
-// Someone is standing at the door waiting on this one - if the server doesn't answer
-// within this window, fall back to the offline credential cache instead of leaving them
-// standing there for the full HTTP_TIMEOUT_MS.
-#define ACCESS_HTTP_TIMEOUT_MS     4000
+// Someone is standing at the door waiting on this one - if the server doesn't
+// answer within this window, fall back to the offline credential cache instead
+// of leaving them standing there for the full HTTP_TIMEOUT_MS.
+#define ACCESS_HTTP_TIMEOUT_MS 4000
 
-// Heartbeat / settings-refresh / offline-sync / enrollment-poll all run periodically from
-// the main loop, which is otherwise busy scanning RFID/fingerprint/keypad. A short timeout
-// here keeps a slow or unreachable server from stalling live scanning for the full
-// HTTP_TIMEOUT_MS on every single background tick - and, since loop() can end up running
-// several of these back-to-back in the same pass, keeps their worst-case combined stall
-// safely under the 15s hardware watchdog window (each call site also re-feeds the watchdog
-// individually as extra headroom - see loop()).
+// Heartbeat / settings-refresh / offline-sync / enrollment-poll all run
+// periodically from the main loop, which is otherwise busy scanning
+// RFID/fingerprint/keypad. A short timeout here keeps a slow or unreachable
+// server from stalling live scanning for the full HTTP_TIMEOUT_MS on every
+// single background tick - and, since loop() can end up running several of
+// these back-to-back in the same pass, keeps their worst-case combined stall
+// safely under the 15s hardware watchdog window (each call site also re-feeds
+// the watchdog individually as extra headroom - see loop()).
 #define BACKGROUND_HTTP_TIMEOUT_MS 3000
 
 // -------------------------------------------------------------------------------------
 // OFFLINE CREDENTIAL CACHE
 // -------------------------------------------------------------------------------------
-// Full RFID+fingerprint+PIN combos for every fully-enrolled active user, synced from
-// GET /api/offline-sync and cached on flash (LittleFS) so the door still unlocks for a
-// registered user with all 3 factors even when the server or WiFi is unreachable. The
-// security bar for the offline path is identical to online: all three factors, matched
-// to the same user. Nothing is relaxed to single-factor.
-#define OFFLINE_CACHE_PATH        "/offline_cache.json"
-#define OFFLINE_SYNC_INTERVAL_MS  300000  // Re-sync every 5 minutes while online
-#define OFFLINE_CACHE_DOC_SIZE    24576   // ~24KB - fits a few hundred synced users
+// Full RFID+fingerprint+PIN combos for every fully-enrolled active user, synced
+// from GET /api/offline-sync and cached on flash (LittleFS) so the door still
+// unlocks for a registered user with all 3 factors even when the server or WiFi
+// is unreachable. The security bar for the offline path is identical to online:
+// all three factors, matched to the same user. Nothing is relaxed to
+// single-factor.
+#define OFFLINE_CACHE_PATH "/offline_cache.json"
+#define OFFLINE_SYNC_INTERVAL_MS 300000 // Re-sync every 5 minutes while online
+#define OFFLINE_CACHE_DOC_SIZE 24576 // ~24KB - fits a few hundred synced users
 
 // -------------------------------------------------------------------------------------
 // 4×3 MATRIX KEYPAD
@@ -131,43 +141,44 @@ const int DEVICE_ID       = 4; // Device ID in TRILOCK database
 //   Cols  (INPUT_PULLUP): C1=GPIO25, C2=GPIO35, C3=GPIO27
 // Keys:  1 2 3 / 4 5 6 / 7 8 9 / * 0 #
 //
-// GPIO35 (C2) is input-only and has no internal pull-up/pull-down (true of GPIO34-39
-// on the ESP32), unlike every other pin used here. Wire an external ~10K resistor from
-// GPIO35 to 3.3V or C2 will float and register phantom keypresses.
+// GPIO35 (C2) is input-only and has no internal pull-up/pull-down (true of
+// GPIO34-39 on the ESP32), unlike every other pin used here. Wire an external
+// ~10K resistor from GPIO35 to 3.3V or C2 will float and register phantom
+// keypresses.
 //
-// Install library: Arduino IDE → Library Manager → search "Keypad" (by Mark Stanley)
+// Install library: Arduino IDE → Library Manager → search "Keypad" (by Mark
+// Stanley)
 // -------------------------------------------------------------------------------------
 
 const byte KEYPAD_ROWS = 4;
 const byte KEYPAD_COLS = 3;
 
 const char KEYPAD_KEYS[KEYPAD_ROWS][KEYPAD_COLS] = {
-  {'1', '2', '3'},
-  {'4', '5', '6'},
-  {'7', '8', '9'},
-  {'*', '0', '#'}
-};
+    {'1', '2', '3'}, {'4', '5', '6'}, {'7', '8', '9'}, {'*', '0', '#'}};
 
 byte rowPins[KEYPAD_ROWS] = {32, 12, 14, 26}; // R1-R4
 byte colPins[KEYPAD_COLS] = {25, 35, 27};     // C1-C3
 
-Keypad keypad = Keypad(makeKeymap(KEYPAD_KEYS), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
+Keypad keypad =
+    Keypad(makeKeymap(KEYPAD_KEYS), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
 
 // PIN entry state machine
-#define PIN_MAX_LEN        8     // Maximum PIN digit count
-#define PIN_ENTRY_TIMEOUT  15000 // ms: clear buffer if idle this long after first keypress
-#define MFA_SESSION_TIMEOUT 30000 // ms: time window to provide all 3 credentials (RFID + FP + PIN)
+#define PIN_MAX_LEN 8 // Maximum PIN digit count
+#define PIN_ENTRY_TIMEOUT                                                      \
+  15000 // ms: clear buffer if idle this long after first keypress
+#define MFA_SESSION_TIMEOUT                                                    \
+  30000 // ms: time window to provide all 3 credentials (RFID + FP + PIN)
 
-String  pinBuffer = "";           // Digits entered so far (plain text, in RAM only)
-unsigned long pinLastKeyMs = 0;   // Millis of last keypress (for timeout)
-bool    pinEntryActive = false;   // True while user is mid-entry
+String pinBuffer = ""; // Digits entered so far (plain text, in RAM only)
+unsigned long pinLastKeyMs = 0; // Millis of last keypress (for timeout)
+bool pinEntryActive = false;    // True while user is mid-entry
 
 // 3-Factor Authentication Session State
-String        currentMfaCardUid     = "";
-int           currentMfaFingerId    = 0;
-String        currentMfaPin         = "";
-unsigned long mfaSessionStartMs     = 0;
-bool          mfaSessionActive      = false;
+String currentMfaCardUid = "";
+int currentMfaFingerId = 0;
+String currentMfaPin = "";
+unsigned long mfaSessionStartMs = 0;
+bool mfaSessionActive = false;
 
 // Short LED blink to confirm each keypress (non-blocking)
 #define KEY_BLINK_MS 80
@@ -175,34 +186,39 @@ unsigned long keyBlinkStart = 0;
 bool keyBlinkActive = false;
 
 // Pin Definitions
-// RFID (MFRC522) is on an explicit, non-default SPI bus — SPI.begin() below is called
-// with these exact pins so it can't silently collide with the keypad or anything else
-// on the default VSPI pins (18/19/23).
-#define SS_PIN          2   // MFRC522 RFID SDA/SS Pin
-#define SCK_PIN         18  // MFRC522 SPI Clock
-#define MOSI_PIN        23  // MFRC522 SPI MOSI
-#define MISO_PIN        19  // MFRC522 SPI MISO
-#define RST_PIN         4   // MFRC522 RFID Reset Pin
-#define RELAY_PIN       13  // Solenoid Lock Relay Control Pin (Active LOW/HIGH)
-#define BUZZER_PIN      15  // Piezo Buzzer Pin
-#define LED_GREEN       2   // Status LED Green (Access Granted)
-#define LED_RED         22  // Status LED Red (Access Denied)
+// RFID (MFRC522) is on an explicit, non-default SPI bus — SPI.begin() below is
+// called with these exact pins so it can't silently collide with the keypad or
+// anything else on the default VSPI pins (18/19/23).
+#define SS_PIN 2      // MFRC522 RFID SDA/SS Pin
+#define SCK_PIN 18    // MFRC522 SPI Clock
+#define MOSI_PIN 23   // MFRC522 SPI MOSI
+#define MISO_PIN 19   // MFRC522 SPI MISO
+#define RST_PIN 4     // MFRC522 RFID Reset Pin
+#define RELAY_PIN 13  // Solenoid Lock Relay Control Pin (Active LOW/HIGH)
+#define BUZZER_PIN 15 // Piezo Buzzer Pin
+#define LED_GREEN 2   // Status LED Green (Access Granted)
+#define LED_RED 22    // Status LED Red (Access Denied)
 
-// No magnetic door contact sensor on this build. GPIO23 is free (unused by anything
-// else in this pin map) if you add one later — set HAS_DOOR_SENSOR to 1 and wire the
-// reed switch to it to enable door-ajar monitoring (see checkDoorSensor()/checkDoorAjar()).
-#define HAS_DOOR_SENSOR  0
-#define DOOR_SENSOR_PIN  23 // Only read when HAS_DOOR_SENSOR is 1 — currently unused
+// No magnetic door contact sensor on this build. GPIO23 is free (unused by
+// anything else in this pin map) if you add one later — set HAS_DOOR_SENSOR to
+// 1 and wire the reed switch to it to enable door-ajar monitoring (see
+// checkDoorSensor()/checkDoorAjar()).
+#define HAS_DOOR_SENSOR 0
+#define DOOR_SENSOR_PIN                                                        \
+  23 // Only read when HAS_DOOR_SENSOR is 1 — currently unused
 
 // Buzzer Behaviour
-#define BUZZER_IS_ACTIVE     0     // 0 = passive piezo (PWM tones), 1 = active buzzer (on/off)
-#define BUZZER_LEDC_CHANNEL  0     // LEDC channel reserved for the buzzer (ESP32 core 2.x)
-#define BUZZER_LEDC_BITS     8     // PWM resolution
-#define DOOR_AJAR_ALARM_MS   15000 // Sound the alarm if the door stays open this long
-#define DOOR_DEBOUNCE_MS     50    // Reed switch debounce window
+#define BUZZER_IS_ACTIVE                                                       \
+  0 // 0 = passive piezo (PWM tones), 1 = active buzzer (on/off)
+#define BUZZER_LEDC_CHANNEL                                                    \
+  0 // LEDC channel reserved for the buzzer (ESP32 core 2.x)
+#define BUZZER_LEDC_BITS 8 // PWM resolution
+#define DOOR_AJAR_ALARM_MS                                                     \
+  15000                     // Sound the alarm if the door stays open this long
+#define DOOR_DEBOUNCE_MS 50 // Reed switch debounce window
 
 // Periodic task intervals (ms)
-#define HEARTBEAT_INTERVAL_MS       30000  // 30s device keep-alive ping
+#define HEARTBEAT_INTERVAL_MS 30000        // 30s device keep-alive ping
 #define SETTINGS_REFRESH_INTERVAL_MS 60000 // 60s settings re-fetch
 
 // Hardware Serial 2 for R307 / AS608 Fingerprint Sensor
@@ -238,43 +254,48 @@ unsigned long lastOfflineSyncMs = 0;
 // -------------------------------------------------------------------------------------
 // BUZZER SUBSYSTEM
 // -------------------------------------------------------------------------------------
-// Tones are played by a small non-blocking sequencer: buzzerPlay() starts a pattern and
-// returns immediately, buzzerUpdate() (called every loop) advances it note by note. This
-// keeps RFID / fingerprint / door polling responsive while the buzzer is sounding.
+// Tones are played by a small non-blocking sequencer: buzzerPlay() starts a
+// pattern and returns immediately, buzzerUpdate() (called every loop) advances
+// it note by note. This keeps RFID / fingerprint / door polling responsive
+// while the buzzer is sounding.
 
 struct BuzzerNote {
-  uint16_t freq;  // Hz, 0 = silent rest
-  uint16_t ms;    // note length in milliseconds
+  uint16_t freq; // Hz, 0 = silent rest
+  uint16_t ms;   // note length in milliseconds
 };
 
 #define NOTE_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 // Priority levels - a pattern never interrupts one with a higher priority.
-#define BZ_PRIO_INFO   0  // chirps, acknowledgements
-#define BZ_PRIO_EVENT  1  // access granted / denied / lock
-#define BZ_PRIO_ALARM  2  // door left open, tamper
+#define BZ_PRIO_INFO 0  // chirps, acknowledgements
+#define BZ_PRIO_EVENT 1 // access granted / denied / lock
+#define BZ_PRIO_ALARM 2 // door left open, tamper
 
 // Sound Patterns
-static const BuzzerNote SND_BOOT[]      = {{1200, 90}, {0, 40}, {1600, 90}, {0, 40}, {2000, 140}};
-static const BuzzerNote SND_WIFI_OK[]   = {{2000, 70}, {0, 40}, {2600, 110}};
+static const BuzzerNote SND_BOOT[] = {
+    {1200, 90}, {0, 40}, {1600, 90}, {0, 40}, {2000, 140}};
+static const BuzzerNote SND_WIFI_OK[] = {{2000, 70}, {0, 40}, {2600, 110}};
 static const BuzzerNote SND_WIFI_FAIL[] = {{700, 160}, {0, 90}, {500, 260}};
-static const BuzzerNote SND_SCAN[]      = {{2400, 45}};
-static const BuzzerNote SND_GRANTED[]   = {{2000, 130}, {0, 50}, {2600, 190}};
-static const BuzzerNote SND_DENIED[]    = {{500, 200}, {0, 90}, {400, 340}};
-static const BuzzerNote SND_LOCK[]      = {{1400, 130}};
-static const BuzzerNote SND_ERROR[]     = {{800, 80}, {0, 60}, {800, 80}, {0, 60}, {800, 80}};
-static const BuzzerNote SND_AJAR[]      = {{2800, 280}, {0, 320}}; // repeated until door closes
-static const BuzzerNote SND_REMOTE[]    = {{1800, 80}, {0, 40}, {2200, 80}, {0, 40}, {2600, 120}};
+static const BuzzerNote SND_SCAN[] = {{2400, 45}};
+static const BuzzerNote SND_GRANTED[] = {{2000, 130}, {0, 50}, {2600, 190}};
+static const BuzzerNote SND_DENIED[] = {{500, 200}, {0, 90}, {400, 340}};
+static const BuzzerNote SND_LOCK[] = {{1400, 130}};
+static const BuzzerNote SND_ERROR[] = {
+    {800, 80}, {0, 60}, {800, 80}, {0, 60}, {800, 80}};
+static const BuzzerNote SND_AJAR[] = {{2800, 280},
+                                      {0, 320}}; // repeated until door closes
+static const BuzzerNote SND_REMOTE[] = {
+    {1800, 80}, {0, 40}, {2200, 80}, {0, 40}, {2600, 120}};
 
 // Sequencer state
-static const BuzzerNote* bzSeq = nullptr;
-static uint8_t  bzLen        = 0;
-static uint8_t  bzIndex      = 0;
-static int16_t  bzRepeats    = 0;   // -1 = loop forever, otherwise remaining repeats
-static uint8_t  bzPriority   = BZ_PRIO_INFO;
-static bool     bzPlaying    = false;
+static const BuzzerNote *bzSeq = nullptr;
+static uint8_t bzLen = 0;
+static uint8_t bzIndex = 0;
+static int16_t bzRepeats = 0; // -1 = loop forever, otherwise remaining repeats
+static uint8_t bzPriority = BZ_PRIO_INFO;
+static bool bzPlaying = false;
 static unsigned long bzNoteStart = 0;
-static bool     buzzerMuted  = false;
+static bool buzzerMuted = false;
 
 void buzzerInit() {
 #if BUZZER_IS_ACTIVE
@@ -292,38 +313,47 @@ void buzzerInit() {
 
 // Drive the buzzer at the given frequency (0 = silence).
 void buzzerOutput(uint16_t freq) {
-  if (buzzerMuted) freq = 0;
+  if (buzzerMuted)
+    freq = 0;
 
 #if BUZZER_IS_ACTIVE
   digitalWrite(BUZZER_PIN, freq > 0 ? HIGH : LOW);
 #elif ESP_ARDUINO_VERSION_MAJOR >= 3
-  if (freq > 0) ledcWriteTone(BUZZER_PIN, freq);
-  else          ledcWrite(BUZZER_PIN, 0);
+  if (freq > 0)
+    ledcWriteTone(BUZZER_PIN, freq);
+  else
+    ledcWrite(BUZZER_PIN, 0);
 #else
-  if (freq > 0) ledcWriteTone(BUZZER_LEDC_CHANNEL, freq);
-  else          ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+  if (freq > 0)
+    ledcWriteTone(BUZZER_LEDC_CHANNEL, freq);
+  else
+    ledcWrite(BUZZER_LEDC_CHANNEL, 0);
 #endif
 }
 
 void buzzerStop() {
-  bzPlaying  = false;
-  bzSeq      = nullptr;
+  bzPlaying = false;
+  bzSeq = nullptr;
   bzPriority = BZ_PRIO_INFO;
   buzzerOutput(0);
 }
 
-// Start a pattern without blocking. repeats: 0 = play once, -1 = loop until buzzerStop().
-// Returns false if the request was dropped in favour of a more important sound.
-bool buzzerPlay(const BuzzerNote* seq, uint8_t len, int16_t repeats, uint8_t priority) {
-  if (len == 0) return false;
-  if (bzPlaying && priority < bzPriority) return false; // never talk over a more important sound
+// Start a pattern without blocking. repeats: 0 = play once, -1 = loop until
+// buzzerStop(). Returns false if the request was dropped in favour of a more
+// important sound.
+bool buzzerPlay(const BuzzerNote *seq, uint8_t len, int16_t repeats,
+                uint8_t priority) {
+  if (len == 0)
+    return false;
+  if (bzPlaying && priority < bzPriority)
+    return false; // never talk over a more important sound
 
-  bzSeq       = seq;
-  bzLen       = len;
-  bzIndex     = 0;
-  bzRepeats   = repeats;
-  bzPriority  = priority;
-  bzPlaying   = true;
+  bzSeq = seq;
+  bzLen = len;
+  bzIndex = 0;
+  bzRepeats = repeats;
+  bzPriority = priority;
+  bzPlaying = true;
   bzNoteStart = millis();
   buzzerOutput(bzSeq[0].freq);
   return true;
@@ -331,8 +361,10 @@ bool buzzerPlay(const BuzzerNote* seq, uint8_t len, int16_t repeats, uint8_t pri
 
 // Advance the sequencer - must be called from loop().
 void buzzerUpdate() {
-  if (!bzPlaying) return;
-  if (millis() - bzNoteStart < bzSeq[bzIndex].ms) return;
+  if (!bzPlaying)
+    return;
+  if (millis() - bzNoteStart < bzSeq[bzIndex].ms)
+    return;
 
   bzIndex++;
   if (bzIndex >= bzLen) {
@@ -340,7 +372,8 @@ void buzzerUpdate() {
       buzzerStop();
       return;
     }
-    if (bzRepeats > 0) bzRepeats--;
+    if (bzRepeats > 0)
+      bzRepeats--;
     bzIndex = 0;
   }
 
@@ -348,10 +381,11 @@ void buzzerUpdate() {
   buzzerOutput(bzSeq[bzIndex].freq);
 }
 
-// Blocking variant - for setup() and for short chirps played right before an HTTP call
-// (the sequencer cannot run while HTTPClient blocks).
-void buzzerPlayNow(const BuzzerNote* seq, uint8_t len) {
-  if (!buzzerPlay(seq, len, 0, BZ_PRIO_INFO)) return;
+// Blocking variant - for setup() and for short chirps played right before an
+// HTTP call (the sequencer cannot run while HTTPClient blocks).
+void buzzerPlayNow(const BuzzerNote *seq, uint8_t len) {
+  if (!buzzerPlay(seq, len, 0, BZ_PRIO_INFO))
+    return;
   while (bzPlaying) {
     buzzerUpdate();
     delay(2);
@@ -360,7 +394,8 @@ void buzzerPlayNow(const BuzzerNote* seq, uint8_t len) {
 
 void buzzerSetMuted(bool muted) {
   buzzerMuted = muted;
-  if (muted) buzzerStop();
+  if (muted)
+    buzzerStop();
 }
 
 // -------------------------------------------------------------------------------------
@@ -387,19 +422,22 @@ void setup() {
 
 #if HAS_DOOR_SENSOR
   pinMode(DOOR_SENSOR_PIN, INPUT_PULLUP);
-  // Seed the door sensor state so we do not fire a bogus event on the first loop
+  // Seed the door sensor state so we do not fire a bogus event on the first
+  // loop
   lastDoorState = digitalRead(DOOR_SENSOR_PIN);
-  rawDoorState  = lastDoorState;
-  if (lastDoorState == LOW) doorOpenedAt = millis();
+  rawDoorState = lastDoorState;
+  if (lastDoorState == LOW)
+    doorOpenedAt = millis();
 #endif
 
-  // Initialize SPI & MFRC522 RFID Reader (explicit pins - do not share the default
-  // VSPI pins with anything else, see Pin Definitions above)
+  // Initialize SPI & MFRC522 RFID Reader (explicit pins - do not share the
+  // default VSPI pins with anything else, see Pin Definitions above)
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   rfid.PCD_Init();
   Serial.println("MFRC522 RFID Reader Initialized.");
 
-  // Initialize Fingerprint Sensor (UART2: RX2=GPIO17 <- sensor TX, TX2=GPIO16 -> sensor RX)
+  // Initialize Fingerprint Sensor (UART2: RX2=GPIO17 <- sensor TX, TX2=GPIO16
+  // -> sensor RX)
   mySerial.begin(57600, SERIAL_8N1, 17, 16);
   finger.begin(57600);
   if (finger.verifyPassword()) {
@@ -409,9 +447,11 @@ void setup() {
     buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
   }
 
-  // Mount the offline credential cache filesystem (format on first boot / corruption)
+  // Mount the offline credential cache filesystem (format on first boot /
+  // corruption)
   if (!LittleFS.begin(true)) {
-    Serial.println("Warning: LittleFS mount failed - offline unlock will be unavailable.");
+    Serial.println(
+        "Warning: LittleFS mount failed - offline unlock will be unavailable.");
   }
 
   // Connect to Wi-Fi Network
@@ -424,21 +464,24 @@ void setup() {
 
   // Start the inbound HTTP server for remote unlock back-channel
   unlockServer.begin();
-  Serial.printf("Remote unlock server listening on port %d\n", UNLOCK_SERVER_PORT);
+  Serial.printf("Remote unlock server listening on port %d\n",
+                UNLOCK_SERVER_PORT);
 
-  // Stamp initial timers so the first periodic task fires after the interval, not immediately
-  lastHeartbeatMs      = millis();
+  // Stamp initial timers so the first periodic task fires after the interval,
+  // not immediately
+  lastHeartbeatMs = millis();
   lastSettingsRefreshMs = millis();
 
   // Initialize Hardware Task Watchdog Timer (15s timeout).
-  // esp_task_wdt_init()'s signature changed between ESP32 Arduino core versions: core 2.x
-  // takes (timeout_seconds, panic_bool) directly, core 3.x (ESP-IDF 5.x) takes a config
-  // struct pointer instead. Branch on ESP_ARDUINO_VERSION_MAJOR so this compiles on either.
+  // esp_task_wdt_init()'s signature changed between ESP32 Arduino core
+  // versions: core 2.x takes (timeout_seconds, panic_bool) directly, core 3.x
+  // (ESP-IDF 5.x) takes a config struct pointer instead. Branch on
+  // ESP_ARDUINO_VERSION_MAJOR so this compiles on either.
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   esp_task_wdt_config_t twdtConfig = {
-    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
-    .idle_core_mask = 0,
-    .trigger_panic = true,
+      .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+      .idle_core_mask = 0,
+      .trigger_panic = true,
   };
   esp_task_wdt_init(&twdtConfig);
 #else
@@ -468,7 +511,8 @@ void loop() {
   updateStatusLeds();
 
   // 1. Check Solenoid Lock Timer
-  if (isDoorUnlocked && (millis() - lockTimer >= (unsigned long)(doorUnlockDuration * 1000))) {
+  if (isDoorUnlocked &&
+      (millis() - lockTimer >= (unsigned long)(doorUnlockDuration * 1000))) {
     lockDoor();
   }
 
@@ -553,13 +597,14 @@ void lockDoor() {
 
   buzzerPlay(SND_LOCK, NOTE_COUNT(SND_LOCK), 0, BZ_PRIO_EVENT);
   Serial.println("DOOR LOCKED");
-  // Door hardware sensor will report 'closed' via checkDoorSensor() independently
+  // Door hardware sensor will report 'closed' via checkDoorSensor()
+  // independently
 }
 
 void denyAccess() {
   digitalWrite(LED_RED, HIGH);
   digitalWrite(LED_GREEN, LOW);
-  ledRedStart  = millis();      // Turned off by updateStatusLeds()
+  ledRedStart = millis(); // Turned off by updateStatusLeds()
   ledRedActive = true;
 
   // Beep Error
@@ -575,7 +620,8 @@ void updateStatusLeds() {
   }
   // Green blink per keypress (shares the green LED briefly)
   if (keyBlinkActive && (millis() - keyBlinkStart >= KEY_BLINK_MS)) {
-    if (!isDoorUnlocked) digitalWrite(LED_GREEN, LOW);
+    if (!isDoorUnlocked)
+      digitalWrite(LED_GREEN, LOW);
     keyBlinkActive = false;
   }
 }
@@ -584,33 +630,39 @@ void updateStatusLeds() {
 // MULTI-FACTOR AUTHENTICATION STATE & HELPER FUNCTIONS
 // -------------------------------------------------------------------------------------
 void resetMfaSession() {
-  currentMfaCardUid  = "";
+  currentMfaCardUid = "";
   currentMfaFingerId = 0;
-  currentMfaPin      = "";
-  mfaSessionStartMs  = 0;
-  mfaSessionActive   = false;
+  currentMfaPin = "";
+  mfaSessionStartMs = 0;
+  mfaSessionActive = false;
 }
 
 void printMfaStatus() {
   int count = (currentMfaCardUid.length() > 0 ? 1 : 0) +
               (currentMfaFingerId > 0 ? 1 : 0) +
               (currentMfaPin.length() > 0 ? 1 : 0);
-  Serial.printf(">>> MFA PROGRESS [%d/3 Required Factors] | RFID: [%s] | Fingerprint: [%s] | PIN: [%s]\n",
-    count,
-    currentMfaCardUid.length() > 0 ? currentMfaCardUid.c_str() : "WAITING",
-    currentMfaFingerId > 0 ? ("ID #" + String(currentMfaFingerId)).c_str() : "WAITING",
-    currentMfaPin.length() > 0 ? "****" : "WAITING"
-  );
+  Serial.printf(
+      ">>> MFA PROGRESS [%d/3 Required Factors] | RFID: [%s] | Fingerprint: "
+      "[%s] | PIN: [%s]\n",
+      count,
+      currentMfaCardUid.length() > 0 ? currentMfaCardUid.c_str() : "WAITING",
+      currentMfaFingerId > 0 ? ("ID #" + String(currentMfaFingerId)).c_str()
+                             : "WAITING",
+      currentMfaPin.length() > 0 ? "****" : "WAITING");
 }
 
 void checkMfaCompletion() {
-  if (currentMfaCardUid.length() > 0 && currentMfaFingerId > 0 && currentMfaPin.length() > 0) {
-    Serial.println(">>> ALL 3 CREDENTIALS COLLECTED (RFID + FP + PIN)! Submitting to server...");
+  if (currentMfaCardUid.length() > 0 && currentMfaFingerId > 0 &&
+      currentMfaPin.length() > 0) {
+    Serial.println(">>> ALL 3 CREDENTIALS COLLECTED (RFID + FP + PIN)! "
+                   "Submitting to server...");
     buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
 
     // Send complete multi-factor verification request to backend
-    sendAccessRequest("multi_factor", "entry", currentMfaCardUid, currentMfaFingerId, currentMfaPin);
-    esp_task_wdt_reset(); // re-feed - the call above can block for up to ACCESS_HTTP_TIMEOUT_MS
+    sendAccessRequest("multi_factor", "entry", currentMfaCardUid,
+                      currentMfaFingerId, currentMfaPin);
+    esp_task_wdt_reset(); // re-feed - the call above can block for up to
+                          // ACCESS_HTTP_TIMEOUT_MS
 
     // Reset buffer after submission
     resetMfaSession();
@@ -628,9 +680,11 @@ void checkRfidCard() {
   // Format Card UID string (e.g. "FA 12 3B 88")
   String cardUid = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
-    if (rfid.uid.uidByte[i] < 0x10) cardUid += "0";
+    if (rfid.uid.uidByte[i] < 0x10)
+      cardUid += "0";
     cardUid += String(rfid.uid.uidByte[i], HEX);
-    if (i < rfid.uid.size - 1) cardUid += " ";
+    if (i < rfid.uid.size - 1)
+      cardUid += " ";
   }
   cardUid.toUpperCase();
 
@@ -639,7 +693,8 @@ void checkRfidCard() {
 
   currentMfaCardUid = cardUid;
   mfaSessionActive = true;
-  if (mfaSessionStartMs == 0) mfaSessionStartMs = millis();
+  if (mfaSessionStartMs == 0)
+    mfaSessionStartMs = millis();
 
   // Chirp + Green LED blink feedback
   digitalWrite(LED_GREEN, HIGH);
@@ -654,17 +709,20 @@ void checkRfidCard() {
 
 void checkFingerprint() {
   uint8_t p = finger.getImage();
-  if (p != FINGERPRINT_OK) return;
+  if (p != FINGERPRINT_OK)
+    return;
 
   p = finger.image2Tz();
-  if (p != FINGERPRINT_OK) return;
+  if (p != FINGERPRINT_OK)
+    return;
 
   p = finger.fingerFastSearch();
   if (p == FINGERPRINT_OK) {
     int fingerId = finger.fingerID;
     currentMfaFingerId = fingerId;
     mfaSessionActive = true;
-    if (mfaSessionStartMs == 0) mfaSessionStartMs = millis();
+    if (mfaSessionStartMs == 0)
+      mfaSessionStartMs = millis();
 
     digitalWrite(LED_GREEN, HIGH);
     keyBlinkStart = millis();
@@ -693,8 +751,10 @@ void checkKeypad() {
       Serial.println("Keypad entry timeout - buffer cleared.");
     }
     // Check timeout for overall Multi-Factor Authentication session
-    if (mfaSessionActive && (millis() - mfaSessionStartMs > MFA_SESSION_TIMEOUT)) {
-      Serial.println("MFA session timed out. Resetting all staged credentials.");
+    if (mfaSessionActive &&
+        (millis() - mfaSessionStartMs > MFA_SESSION_TIMEOUT)) {
+      Serial.println(
+          "MFA session timed out. Resetting all staged credentials.");
       resetMfaSession();
       buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
     }
@@ -710,13 +770,15 @@ void checkKeypad() {
   pinLastKeyMs = millis();
   pinEntryActive = true;
   mfaSessionActive = true;
-  if (mfaSessionStartMs == 0) mfaSessionStartMs = millis();
+  if (mfaSessionStartMs == 0)
+    mfaSessionStartMs = millis();
 
   if (key == '#') {
     // Stage PIN into MFA session
     if (pinBuffer.length() >= 4) {
       currentMfaPin = pinBuffer;
-      Serial.printf("[Factor 3/3] Keypad PIN Captured: %s\n", currentMfaPin.c_str());
+      Serial.printf("[Factor 3/3] Keypad PIN Captured: %s\n",
+                    currentMfaPin.c_str());
       printMfaStatus();
       checkMfaCompletion();
     } else {
@@ -734,7 +796,8 @@ void checkKeypad() {
     buzzerPlayNow(SND_DENIED, NOTE_COUNT(SND_DENIED));
   } else if (pinBuffer.length() < PIN_MAX_LEN) {
     pinBuffer += key;
-    Serial.printf("Keypad PIN digit added (%d/%d)\n", pinBuffer.length(), PIN_MAX_LEN);
+    Serial.printf("Keypad PIN digit added (%d/%d)\n", pinBuffer.length(),
+                  PIN_MAX_LEN);
   }
 }
 
@@ -742,13 +805,16 @@ void checkKeypad() {
 // HARDWARE ENROLLMENT ENGINE (PIN Keypad, AS608 Fingerprint, MFRC522 RFID)
 // -------------------------------------------------------------------------------------
 void pollEnrollmentCommand() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED)
+    return;
 
   HTTPClient http;
-  // device_id identifies which physical controller is asking, so the server only ever
-  // hands back a command from an enrollment session started against this device — not
-  // one meant for a different door, once more than one controller is registered.
-  String url = String(SERVER_URL) + "/api/esp32/enroll/poll?device_id=" + String(DEVICE_ID);
+  // device_id identifies which physical controller is asking, so the server
+  // only ever hands back a command from an enrollment session started against
+  // this device — not one meant for a different door, once more than one
+  // controller is registered.
+  String url = String(SERVER_URL) +
+               "/api/esp32/enroll/poll?device_id=" + String(DEVICE_ID);
   http.begin(url);
   http.setTimeout(BACKGROUND_HTTP_TIMEOUT_MS);
   http.addHeader("X-Device-Token", DEVICE_API_KEY);
@@ -760,12 +826,13 @@ void pollEnrollmentCommand() {
     StaticJsonDocument<256> doc;
     deserializeJson(doc, response);
 
-    const char* status = doc["status"];
+    const char *status = doc["status"];
     if (String(status) == "command_pending") {
-      const char* token = doc["session_token"];
-      const char* cmd   = doc["command"];
+      const char *token = doc["session_token"];
+      const char *cmd = doc["command"];
 
-      Serial.printf(">>> ENROLLMENT COMMAND RECEIVED: [%s] for session [%s]\n", cmd, token);
+      Serial.printf(">>> ENROLLMENT COMMAND RECEIVED: [%s] for session [%s]\n",
+                    cmd, token);
 
       if (String(cmd) == "pin") {
         enrollPinOnKeypad(String(token));
@@ -808,13 +875,15 @@ void enrollPinOnKeypad(String sessionToken) {
         enrolledPin += key;
       }
     }
-    esp_task_wdt_reset(); // this wait can run up to timeoutMs, well past the 15s WDT window
+    esp_task_wdt_reset(); // this wait can run up to timeoutMs, well past the
+                          // 15s WDT window
     delay(20);
   }
 
   Serial.println("Keypad PIN enrollment timed out.");
   buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
-  sendEnrollmentResult("pin", sessionToken, "failed", "", 0, "Timeout: No PIN typed on keypad.");
+  sendEnrollmentResult("pin", sessionToken, "failed", "", 0,
+                       "Timeout: No PIN typed on keypad.");
 }
 
 // 2. HARDWARE FINGERPRINT ENROLLMENT (AS608 / R503)
@@ -828,7 +897,8 @@ void enrollFingerprintOnSensor(String sessionToken) {
     id++;
   }
   if (id > 127) {
-    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Sensor full (127 slots).");
+    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0,
+                         "Sensor full (127 slots).");
     return;
   }
 
@@ -843,13 +913,15 @@ void enrollFingerprintOnSensor(String sessionToken) {
     delay(100);
   }
   if (p != FINGERPRINT_OK) {
-    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Timeout waiting for finger.");
+    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0,
+                         "Timeout waiting for finger.");
     return;
   }
 
   p = finger.image2Tz(1);
   if (p != FINGERPRINT_OK) {
-    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Image conversion failed.");
+    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0,
+                         "Image conversion failed.");
     return;
   }
 
@@ -861,7 +933,8 @@ void enrollFingerprintOnSensor(String sessionToken) {
   startMs = millis();
   while (p != FINGERPRINT_NOFINGER && (millis() - startMs < 10000)) {
     p = finger.getImage();
-    esp_task_wdt_reset(); // unbounded without the 10s cap - past the 15s WDT window otherwise
+    esp_task_wdt_reset(); // unbounded without the 10s cap - past the 15s WDT
+                          // window otherwise
     delay(100);
   }
 
@@ -876,20 +949,23 @@ void enrollFingerprintOnSensor(String sessionToken) {
     delay(100);
   }
   if (p != FINGERPRINT_OK) {
-    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Timeout on second scan.");
+    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0,
+                         "Timeout on second scan.");
     return;
   }
 
   p = finger.image2Tz(2);
   if (p != FINGERPRINT_OK) {
-    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Second image conversion failed.");
+    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0,
+                         "Second image conversion failed.");
     return;
   }
 
   // Step 3: Create and Store model
   p = finger.createModel();
   if (p != FINGERPRINT_OK) {
-    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Fingerprint templates do not match.");
+    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0,
+                         "Fingerprint templates do not match.");
     return;
   }
 
@@ -899,7 +975,8 @@ void enrollFingerprintOnSensor(String sessionToken) {
     buzzerPlayNow(SND_GRANTED, NOTE_COUNT(SND_GRANTED));
     sendEnrollmentResult("fingerprint", sessionToken, "success", "", id);
   } else {
-    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Failed to store fingerprint model.");
+    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0,
+                         "Failed to store fingerprint model.");
   }
 }
 
@@ -913,9 +990,11 @@ void enrollRfidOnSensor(String sessionToken) {
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
       String cardUid = "";
       for (byte i = 0; i < rfid.uid.size; i++) {
-        if (rfid.uid.uidByte[i] < 0x10) cardUid += "0";
+        if (rfid.uid.uidByte[i] < 0x10)
+          cardUid += "0";
         cardUid += String(rfid.uid.uidByte[i], HEX);
-        if (i < rfid.uid.size - 1) cardUid += " ";
+        if (i < rfid.uid.size - 1)
+          cardUid += " ";
       }
       cardUid.toUpperCase();
 
@@ -934,14 +1013,18 @@ void enrollRfidOnSensor(String sessionToken) {
 
   Serial.println("RFID card enrollment timed out.");
   buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
-  sendEnrollmentResult("rfid", sessionToken, "failed", "", 0, "Timeout: No RFID card tapped.");
+  sendEnrollmentResult("rfid", sessionToken, "failed", "", 0,
+                       "Timeout: No RFID card tapped.");
 }
 
 // Helper: POST enrollment result back to Laravel API
-// (default for errMsg lives on the prototype above only - repeating it here is illegal
-// in C++, a default argument may be specified in exactly one of the two.)
-void sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg) {
-  if (WiFi.status() != WL_CONNECTED) return;
+// (default for errMsg lives on the prototype above only - repeating it here is
+// illegal in C++, a default argument may be specified in exactly one of the
+// two.)
+void sendEnrollmentResult(String type, String token, String status,
+                          String valueStr, int valueInt, String errMsg) {
+  if (WiFi.status() != WL_CONNECTED)
+    return;
 
   HTTPClient http;
   String endpoint = "/api/esp32/enroll/" + type + "/result";
@@ -955,20 +1038,24 @@ void sendEnrollmentResult(String type, String token, String status, String value
 
   StaticJsonDocument<256> doc;
   doc["session_token"] = token;
-  doc["status"]        = status;
-  if (type == "pin")         doc["pin"]            = valueStr;
-  if (type == "rfid")        doc["rfid_uid"]       = valueStr;
-  if (type == "fingerprint") doc["fingerprint_id"] = valueInt;
-  if (errMsg.length() > 0)   doc["message"]        = errMsg;
+  doc["status"] = status;
+  if (type == "pin")
+    doc["pin"] = valueStr;
+  if (type == "rfid")
+    doc["rfid_uid"] = valueStr;
+  if (type == "fingerprint")
+    doc["fingerprint_id"] = valueInt;
+  if (errMsg.length() > 0)
+    doc["message"] = errMsg;
 
   String jsonPayload;
   serializeJson(doc, jsonPayload);
 
   int httpCode = http.POST(jsonPayload);
-  Serial.printf("Enrollment result [%s] sent to server (HTTP %d)\n", type.c_str(), httpCode);
+  Serial.printf("Enrollment result [%s] sent to server (HTTP %d)\n",
+                type.c_str(), httpCode);
   http.end();
 }
-
 
 void checkDoorSensor() {
   bool currentDoorState = digitalRead(DOOR_SENSOR_PIN);
@@ -979,8 +1066,10 @@ void checkDoorSensor() {
     doorChangeTimer = millis();
     return;
   }
-  if (currentDoorState == lastDoorState) return;
-  if (millis() - doorChangeTimer < DOOR_DEBOUNCE_MS) return;
+  if (currentDoorState == lastDoorState)
+    return;
+  if (millis() - doorChangeTimer < DOOR_DEBOUNCE_MS)
+    return;
 
   lastDoorState = currentDoorState;
 
@@ -1002,31 +1091,40 @@ void checkDoorSensor() {
 
 // Continuous alarm while the door is held open past the allowed window.
 void checkDoorAjar() {
-  if (lastDoorState != LOW) return;              // Door closed - nothing to do
-  if (doorAjarAlarmActive) return;               // Already sounding
-  if (doorOpenedAt == 0) return;
-  if (millis() - doorOpenedAt < DOOR_AJAR_ALARM_MS) return;
+  if (lastDoorState != LOW)
+    return; // Door closed - nothing to do
+  if (doorAjarAlarmActive)
+    return; // Already sounding
+  if (doorOpenedAt == 0)
+    return;
+  if (millis() - doorOpenedAt < DOOR_AJAR_ALARM_MS)
+    return;
 
   doorAjarAlarmActive = true;
   Serial.println("ALARM: Door left open!");
 
-  // Report first - the blocking HTTP call would otherwise stretch the alarm's first note
-  sendDoorStatusUpdate("left_open", "Door left open beyond allowed time - buzzer alarm active");
-  buzzerPlay(SND_AJAR, NOTE_COUNT(SND_AJAR), -1, BZ_PRIO_ALARM); // Loop until door closes
+  // Report first - the blocking HTTP call would otherwise stretch the alarm's
+  // first note
+  sendDoorStatusUpdate(
+      "left_open", "Door left open beyond allowed time - buzzer alarm active");
+  buzzerPlay(SND_AJAR, NOTE_COUNT(SND_AJAR), -1,
+             BZ_PRIO_ALARM); // Loop until door closes
 }
 
 // -------------------------------------------------------------------------------------
 // REMOTE UNLOCK BACK-CHANNEL (inbound HTTP from Laravel server)
 // -------------------------------------------------------------------------------------
-// Laravel POSTs to http://<ESP32_IP>:8080/unlock to physically fire the solenoid.
-// The server reads the request line, extracts the unlock duration from the JSON body,
-// fires the solenoid, and responds with a short JSON ack.
+// Laravel POSTs to http://<ESP32_IP>:8080/unlock to physically fire the
+// solenoid. The server reads the request line, extracts the unlock duration
+// from the JSON body, fires the solenoid, and responds with a short JSON ack.
 void checkRemoteUnlockServer() {
   WiFiClient client = unlockServer.available();
-  if (!client) return;
+  if (!client)
+    return;
 
   unsigned long clientTimeout = millis() + 2000;
-  while (!client.available() && millis() < clientTimeout) delay(1);
+  while (!client.available() && millis() < clientTimeout)
+    delay(1);
 
   if (!client.available()) {
     client.stop();
@@ -1048,14 +1146,16 @@ void checkRemoteUnlockServer() {
     if (headerLine.startsWith("Content-Length:")) {
       contentLength = headerLine.substring(16).toInt();
     }
-    if (headerLine.length() == 0) break; // blank line = end of headers
+    if (headerLine.length() == 0)
+      break; // blank line = end of headers
   }
 
   // Read JSON body
   String body = "";
   unsigned long bodyTimeout = millis() + 1000;
   while ((int)body.length() < contentLength && millis() < bodyTimeout) {
-    if (client.available()) body += (char)client.read();
+    if (client.available())
+      body += (char)client.read();
   }
 
   int unlockSecs = doorUnlockDuration; // default to current setting
@@ -1073,10 +1173,13 @@ void checkRemoteUnlockServer() {
     unlockDoor(unlockSecs);
     buzzerPlay(SND_REMOTE, NOTE_COUNT(SND_REMOTE), 0, BZ_PRIO_EVENT);
     Serial.printf("Remote unlock executed: %ds\n", unlockSecs);
-    httpResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-                   "{\"status\":\"unlocked\",\"duration\":" + String(unlockSecs) + "}";
+    httpResponse = "HTTP/1.1 200 OK\r\nContent-Type: "
+                   "application/json\r\nConnection: close\r\n\r\n"
+                   "{\"status\":\"unlocked\",\"duration\":" +
+                   String(unlockSecs) + "}";
   } else {
-    httpResponse = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+    httpResponse = "HTTP/1.1 400 Bad Request\r\nContent-Type: "
+                   "application/json\r\nConnection: close\r\n\r\n"
                    "{\"status\":\"error\",\"message\":\"Unknown command\"}";
   }
 
@@ -1088,12 +1191,14 @@ void checkRemoteUnlockServer() {
 // -------------------------------------------------------------------------------------
 // REST API COMMUNICATIONS
 // -------------------------------------------------------------------------------------
-void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode) {
+void sendAccessRequest(String method, String accessType, String cardUid,
+                       int fingerprintId, String pinCode) {
   int httpResponseCode = -1;
   String response;
 
-  // Only attempt the network round-trip if WiFi is actually up - skip straight to the
-  // offline fallback below rather than waiting out an HTTP timeout with no link at all.
+  // Only attempt the network round-trip if WiFi is actually up - skip straight
+  // to the offline fallback below rather than waiting out an HTTP timeout with
+  // no link at all.
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     String url = String(SERVER_URL) + "/api/access";
@@ -1106,16 +1211,20 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     StaticJsonDocument<256> doc;
     doc["auth_method"] = method;
     doc["access_type"] = accessType;
-    if (cardUid.length() > 0) doc["card_uid"] = cardUid;
-    if (fingerprintId > 0) doc["fingerprint_id"] = fingerprintId;
-    if (pinCode.length() > 0) doc["pin_code"] = pinCode;
+    if (cardUid.length() > 0)
+      doc["card_uid"] = cardUid;
+    if (fingerprintId > 0)
+      doc["fingerprint_id"] = fingerprintId;
+    if (pinCode.length() > 0)
+      doc["pin_code"] = pinCode;
     doc["device_id"] = DEVICE_ID;
 
     String jsonPayload;
     serializeJson(doc, jsonPayload);
 
     httpResponseCode = http.POST(jsonPayload);
-    if (httpResponseCode > 0) response = http.getString();
+    if (httpResponseCode > 0)
+      response = http.getString();
     http.end();
   }
 
@@ -1123,7 +1232,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     StaticJsonDocument<512> responseDoc;
     deserializeJson(responseDoc, response);
 
-    const char* status = responseDoc["status"];
+    const char *status = responseDoc["status"];
     if (String(status) == "granted") {
       int unlockSecs = responseDoc["unlock_duration"] | 5;
       int accessLogId = responseDoc["access_log_id"] | 0;
@@ -1153,32 +1262,38 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
 
   // ---------------------------------------------------------------------------------
   // OFFLINE FALLBACK - WiFi down, or the server didn't respond. Only the full
-  // RFID+fingerprint+PIN combo is ever checked offline (see checkMfaCompletion()) so
-  // this is the same security bar as the online path, just verified locally.
+  // RFID+fingerprint+PIN combo is ever checked offline (see
+  // checkMfaCompletion()) so this is the same security bar as the online path,
+  // just verified locally.
   // ---------------------------------------------------------------------------------
-  Serial.println(WiFi.status() == WL_CONNECTED
-    ? "Server unreachable - checking offline credential cache..."
-    : "WiFi disconnected - checking offline credential cache...");
+  Serial.println(
+      WiFi.status() == WL_CONNECTED
+          ? "Server unreachable - checking offline credential cache..."
+          : "WiFi disconnected - checking offline credential cache...");
 
-  if (method == "multi_factor" && attemptOfflineUnlock(cardUid, fingerprintId, pinCode)) {
+  if (method == "multi_factor" &&
+      attemptOfflineUnlock(cardUid, fingerprintId, pinCode)) {
     Serial.println(">>> OFFLINE ACCESS GRANTED (matched local cache) <<<");
     buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
-    unlockDoor(doorUnlockDuration); // last value fetched from /api/settings while online
+    unlockDoor(doorUnlockDuration); // last value fetched from /api/settings
+                                    // while online
   } else {
-    Serial.println("OFFLINE ACCESS DENIED - no matching cached credential set.");
+    Serial.println(
+        "OFFLINE ACCESS DENIED - no matching cached credential set.");
     denyAccess();
-    // Played last so it overrides the denial tone - a connectivity fault should sound
-    // audibly different from a rejected card.
+    // Played last so it overrides the denial tone - a connectivity fault should
+    // sound audibly different from a rejected card.
     buzzerPlay(SND_ERROR, NOTE_COUNT(SND_ERROR), 0, BZ_PRIO_EVENT);
   }
 }
 
-// Pulls the RFID+fingerprint+PIN combo list down from /api/offline-sync and caches it
-// verbatim to flash. Streamed straight to the file - the payload can be tens of KB for
-// a large user base, too much to hold in RAM as a String on top of the JSON doc used to
-// read it back later.
+// Pulls the RFID+fingerprint+PIN combo list down from /api/offline-sync and
+// caches it verbatim to flash. Streamed straight to the file - the payload can
+// be tens of KB for a large user base, too much to hold in RAM as a String on
+// top of the JSON doc used to read it back later.
 void syncOfflineCache() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED)
+    return;
 
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/offline-sync";
@@ -1198,24 +1313,29 @@ void syncOfflineCache() {
       Serial.println("Failed to open offline cache file for writing.");
     }
   } else {
-    Serial.printf("Offline cache sync failed (HTTP %d), keeping previous cache.\n", code);
+    Serial.printf(
+        "Offline cache sync failed (HTTP %d), keeping previous cache.\n", code);
   }
   http.end();
 }
 
-// Checks a collected RFID+fingerprint+PIN combo against the cached offline credential
-// list. All three must be present and match the same synced entry - never a partial
-// (single-factor) match, matching the server's online multi_factor rule.
+// Checks a collected RFID+fingerprint+PIN combo against the cached offline
+// credential list. All three must be present and match the same synced entry -
+// never a partial (single-factor) match, matching the server's online
+// multi_factor rule.
 bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode) {
-  if (cardUid.length() == 0 || fingerprintId <= 0 || pinCode.length() == 0) return false;
+  if (cardUid.length() == 0 || fingerprintId <= 0 || pinCode.length() == 0)
+    return false;
 
   if (!LittleFS.exists(OFFLINE_CACHE_PATH)) {
-    Serial.println("No offline credential cache on this device yet (never synced while online).");
+    Serial.println("No offline credential cache on this device yet (never "
+                   "synced while online).");
     return false;
   }
 
   File f = LittleFS.open(OFFLINE_CACHE_PATH, "r");
-  if (!f) return false;
+  if (!f)
+    return false;
 
   DynamicJsonDocument doc(OFFLINE_CACHE_DOC_SIZE);
   DeserializationError err = deserializeJson(doc, f);
@@ -1229,12 +1349,11 @@ bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode) {
 
   JsonArray entries = doc["data"].as<JsonArray>();
   for (JsonObject entry : entries) {
-    const char* eCardUid  = entry["card_uid"] | "";
-    int         eFinger   = entry["fingerprint_id"] | 0;
-    const char* ePinHash  = entry["pin_offline_hash"] | "";
+    const char *eCardUid = entry["card_uid"] | "";
+    int eFinger = entry["fingerprint_id"] | 0;
+    const char *ePinHash = entry["pin_offline_hash"] | "";
 
-    if (cardUid.equalsIgnoreCase(eCardUid) &&
-        fingerprintId == eFinger &&
+    if (cardUid.equalsIgnoreCase(eCardUid) && fingerprintId == eFinger &&
         pinHashHex.equalsIgnoreCase(ePinHash)) {
       return true;
     }
@@ -1242,20 +1361,22 @@ bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode) {
   return false;
 }
 
-// SHA-256 of `input`, lowercase hex - must match Laravel's hash('sha256', $pin.$salt).
+// SHA-256 of `input`, lowercase hex - must match Laravel's hash('sha256',
+// $pin.$salt).
 String sha256Hex(String input) {
   unsigned char hash[32];
   mbedtls_md_context_t ctx;
   mbedtls_md_init(&ctx);
   mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
   mbedtls_md_starts(&ctx);
-  mbedtls_md_update(&ctx, (const unsigned char*)input.c_str(), input.length());
+  mbedtls_md_update(&ctx, (const unsigned char *)input.c_str(), input.length());
   mbedtls_md_finish(&ctx, hash);
   mbedtls_md_free(&ctx);
 
   String hex = "";
   for (int i = 0; i < 32; i++) {
-    if (hash[i] < 0x10) hex += "0";
+    if (hash[i] < 0x10)
+      hex += "0";
     hex += String(hash[i], HEX);
   }
   hex.toLowerCase();
@@ -1263,7 +1384,8 @@ String sha256Hex(String input) {
 }
 
 void fetchServerSettings() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED)
+    return;
 
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/settings";
@@ -1288,16 +1410,19 @@ void fetchServerSettings() {
     Serial.print("Buzzer: ");
     Serial.println(buzzerEnabled ? "ENABLED" : "MUTED");
   } else {
-    Serial.printf("Settings fetch failed (HTTP %d), keeping previous values.\n", httpResponseCode);
+    Serial.printf("Settings fetch failed (HTTP %d), keeping previous values.\n",
+                  httpResponseCode);
   }
   http.end();
 }
 
 void sendDoorStatusUpdate(String status, String remarks) {
   // Only 'opened' and 'closed' are valid door hardware sensor states
-  if (status != "opened" && status != "closed") return;
+  if (status != "opened" && status != "closed")
+    return;
 
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED)
+    return;
 
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/door-status";
@@ -1308,8 +1433,8 @@ void sendDoorStatusUpdate(String status, String remarks) {
   http.addHeader("Content-Type", "application/json");
 
   StaticJsonDocument<256> doc;
-  doc["status"]    = status;
-  doc["remarks"]   = remarks;
+  doc["status"] = status;
+  doc["remarks"] = remarks;
   doc["device_id"] = DEVICE_ID;
 
   String jsonPayload;
@@ -1322,7 +1447,8 @@ void sendDoorStatusUpdate(String status, String remarks) {
 // DEVICE HEARTBEAT
 // -------------------------------------------------------------------------------------
 void sendHeartbeat() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED)
+    return;
 
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/heartbeat";
@@ -1345,10 +1471,11 @@ void sendHeartbeat() {
     StaticJsonDocument<256> respDoc;
     deserializeJson(respDoc, response);
 
-    const char* pendingCmd = respDoc["pending_command"];
+    const char *pendingCmd = respDoc["pending_command"];
     if (pendingCmd && String(pendingCmd) == "unlock") {
       int unlockSecs = respDoc["duration"] | doorUnlockDuration;
-      Serial.printf(">>> CLOUD REMOTE UNLOCK COMMAND RECEIVED! Duration: %ds\n", unlockSecs);
+      Serial.printf(">>> CLOUD REMOTE UNLOCK COMMAND RECEIVED! Duration: %ds\n",
+                    unlockSecs);
       unlockDoor(unlockSecs);
       buzzerPlay(SND_REMOTE, NOTE_COUNT(SND_REMOTE), 0, BZ_PRIO_EVENT);
     } else if (pendingCmd && String(pendingCmd) == "lock") {

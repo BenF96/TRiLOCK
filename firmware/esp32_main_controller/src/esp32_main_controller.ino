@@ -84,12 +84,12 @@ void connectWiFi();
 // -------------------------------------------------------------------------------------
 const char* WIFI_SSID      = "Redmi Note 11";
 const char* WIFI_PASSWORD  = "benben96";
-const char* SERVER_URL     = "http://10.65.130.35:8000"; // TRILOCK Backend Server IP
-const char* DEVICE_API_KEY = "trilock_dev_g0C9agNqMfjX7VQcIa6lprujxud4KvTxm0LA0WHu8x0U6P6G"; // Matches TRILOCK_DEVICE_API_KEY
+const char* SERVER_URL     = "https://trilock-lx5t.onrender.com"; // TRILOCK Backend Server IP
+const char* DEVICE_API_KEY = "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
 
 // Must match TRILOCK_OFFLINE_PIN_SALT in the server's .env exactly — used to verify a
 // keypad PIN locally, without ever storing the PIN itself in plaintext on the device.
-const char* OFFLINE_PIN_SALT = "trilock_offline_salt_change_me";
+const char* OFFLINE_PIN_SALT = "ab80053da114cdb5b40512dabcb63bbd";
 
 const int DEVICE_ID       = 4; // Device ID in TRILOCK database
 
@@ -127,13 +127,16 @@ const int DEVICE_ID       = 4; // Device ID in TRILOCK database
 // 4×3 MATRIX KEYPAD
 // -------------------------------------------------------------------------------------
 // Wiring:
-//   Rows  (OUTPUT):  R1=GPIO32, R2=GPIO12, R3=GPIO14, R4=GPIO26
-//   Cols  (INPUT_PULLUP): C1=GPIO25, C2=GPIO35, C3=GPIO27
+//   Rows (INPUT_PULLUP, read by the library): R1=GPIO32, R2=GPIO12, R3=GPIO14, R4=GPIO26
+//   Cols (driven OUTPUT by the library, pulsed LOW to scan): C1=GPIO25, C2=GPIO33, C3=GPIO27
 // Keys:  1 2 3 / 4 5 6 / 7 8 9 / * 0 #
 //
-// GPIO35 (C2) is input-only and has no internal pull-up/pull-down (true of GPIO34-39
-// on the ESP32), unlike every other pin used here. Wire an external ~10K resistor from
-// GPIO35 to 3.3V or C2 will float and register phantom keypresses.
+// The Keypad library (chris--a/Keypad, Keypad.cpp::scanKeys()) drives each COLUMN pin as
+// OUTPUT to pulse it LOW/HIGH while reading ROW pins as INPUT_PULLUP — the reverse of what
+// the pin names suggest. Column pins must therefore be regular GPIOs capable of digital
+// output. GPIO34-39 are input-only on the ESP32 (no output driver at all) and must never be
+// used as a column pin — using GPIO35 here previously threw a "GPIO output gpio_num error"
+// on every scan (every loop() iteration) and silently failed to detect that column's keys.
 //
 // Install library: Arduino IDE → Library Manager → search "Keypad" (by Mark Stanley)
 // -------------------------------------------------------------------------------------
@@ -149,7 +152,7 @@ const char KEYPAD_KEYS[KEYPAD_ROWS][KEYPAD_COLS] = {
 };
 
 byte rowPins[KEYPAD_ROWS] = {32, 12, 14, 26}; // R1-R4
-byte colPins[KEYPAD_COLS] = {25, 35, 27};     // C1-C3
+byte colPins[KEYPAD_COLS] = {25, 33, 27};     // C1-C3
 
 Keypad keypad = Keypad(makeKeymap(KEYPAD_KEYS), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
 

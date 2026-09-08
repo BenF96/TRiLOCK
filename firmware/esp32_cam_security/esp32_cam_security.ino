@@ -52,7 +52,7 @@
 // -------------------------------------------------------------------------------------
 const char* WIFI_SSID      = "Redmi Note 11";
 const char* WIFI_PASSWORD  = "benben96";
-const char* SERVER_URL     = "http://10.65.130.35:8000/api/upload-image";
+const char* SERVER_URL     = "https://trilock-lx5t.onrender.com/api/upload-image";
 const char* DEVICE_API_KEY = "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
 
 #define HTTP_TIMEOUT_MS   10000 // Max upload wait time (large JPEG over WiFi)
