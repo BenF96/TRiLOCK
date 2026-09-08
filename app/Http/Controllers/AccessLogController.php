@@ -1,0 +1,44 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\AccessLog;
+
+class AccessLogController extends Controller
+{
+    public function index(Request $request)
+    {
+        $query = AccessLog::with(['user', 'device']);
+
+        if ($request->filled('search')) {
+            $search = $request->search;
+            $query->whereHas('user', function ($q) use ($search) {
+                $q->where('first_name', 'like', "%{$search}%")
+                  ->orWhere('last_name', 'like', "%{$search}%")
+                  ->orWhere('employee_student_id', 'like', "%{$search}%")
+                  ->orWhere('email', 'like', "%{$search}%");
+            });
+        }
+
+        if ($request->filled('access_type')) {
+            $query->where('access_type', $request->access_type);
+        }
+
+        if ($request->filled('auth_method')) {
+            $query->where('authentication_method', $request->auth_method);
+        }
+
+        if ($request->filled('date_from')) {
+            $query->whereDate('date', '>=', $request->date_from);
+        }
+
+        if ($request->filled('date_to')) {
+            $query->whereDate('date', '<=', $request->date_to);
+        }
+
+        $logs = $query->orderBy('created_at', 'desc')->paginate(15);
+
+        return view('logs.index', compact('logs'));
+    }
+}

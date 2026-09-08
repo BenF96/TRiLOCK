@@ -1,0 +1,97 @@
+name: trilock
+
+# Production-shaped compose stack. Ships one image (built once by the `app`
+# service) and reuses it for the queue worker and scheduler by overriding
+# `command` — each role scales independently:
+#   docker compose up --build -d
+#   docker compose run --rm app php artisan migrate --force   # one-time, per deploy
+#   docker compose up -d --scale app=3 --scale queue=2
+#
+# Put a load balancer (nginx, Traefik, your cloud provider's LB, ...) in
+# front of the `app` replicas when you scale it past 1 — this file
+# intentionally doesn't bundle one, since the right choice depends on where
+# you're deploying.
+#
+# Database: this app targets managed Supabase Postgres by default (see
+# .env.example) rather than a container, since that's what production runs
+# against. Enable the `local` profile below if you want a throwaway Postgres
+# for local development instead.
+
+x-app-image: &app-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: trilock:latest
+  env_file: .env
+  environment:
+    # Force the in-container hostname regardless of what .env says, so a
+    # .env written for non-Docker local dev (REDIS_HOST=127.0.0.1) still
+    # works correctly under compose.
+    REDIS_HOST: redis
+  volumes:
+    - storage_public:/var/www/html/storage/app/public
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  app:
+    <<: *app-image
+    ports:
+      - "${APP_PORT:-8080}:8080"
+
+  queue:
+    <<: *app-image
+    ports: []
+    # No connection argument here on purpose — queue:work defaults to
+    # QUEUE_CONNECTION from .env. Hardcoding a connection here would let this
+    # drift out of sync with whatever jobs actually get dispatched to.
+    command: >
+      php artisan queue:work --sleep=2 --tries=3
+      --backoff=5 --max-time=3600 --timeout=90
+    healthcheck:
+      disable: true
+
+  scheduler:
+    <<: *app-image
+    ports: []
+    command: php artisan schedule:work
+    healthcheck:
+      disable: true
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Optional local Postgres for development without a Supabase project.
+  # `docker compose --profile local up` also brings this up; point
+  # DB_HOST=postgres / DB_PORT=5432 at it in your .env when using it.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["local"]
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-trilock}
+      POSTGRES_USER: ${DB_USERNAME:-trilock}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-trilock}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-trilock}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  storage_public:
+  redis_data:
+  postgres_data:
