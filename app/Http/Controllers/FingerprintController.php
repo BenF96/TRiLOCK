@@ -51,12 +51,18 @@ class FingerprintController extends Controller
         $fingerprint->status = ($fingerprint->status === 'active') ? 'disabled' : 'active';
         $fingerprint->save();
 
+        UserController::notifyDevicesToSync();
+
         return back()->with('success', "Fingerprint #{$fingerprint->fingerprint_id} status changed to {$fingerprint->status}.");
     }
 
     public function destroy(Fingerprint $fingerprint)
     {
+        $fpId = $fingerprint->fingerprint_id;
         $fingerprint->delete();
-        return back()->with('success', "Fingerprint #{$fingerprint->fingerprint_id} deleted.");
+
+        UserController::notifyDevicesToSync([$fpId]);
+
+        return back()->with('success', "Fingerprint #{$fpId} deleted.");
     }
 }

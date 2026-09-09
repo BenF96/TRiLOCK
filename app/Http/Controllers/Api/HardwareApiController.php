@@ -369,11 +369,12 @@ class HardwareApiController extends Controller
         $pendingCmd = Cache::pull("trilock_pending_command_{$validated['device_id']}");
 
         return response()->json([
-            'status'          => 'ok',
-            'device'          => $device ? $device->device_name : null,
-            'pending_command' => $pendingCmd['command'] ?? null,
-            'duration'        => $pendingCmd['duration'] ?? null,
-            'time'            => now()->toDateTimeString(),
+            'status'                  => 'ok',
+            'device'                  => $device ? $device->device_name : null,
+            'pending_command'         => $pendingCmd['command'] ?? null,
+            'duration'                => $pendingCmd['duration'] ?? null,
+            'deleted_fingerprint_ids' => $pendingCmd['deleted_fingerprint_ids'] ?? [],
+            'time'                    => now()->toDateTimeString(),
         ]);
     }
 
@@ -383,6 +384,7 @@ class HardwareApiController extends Controller
      * still verify a full RFID+fingerprint+PIN combo when the server is unreachable.
      * Only users with all three credentials active are included — offline mode still
      * requires all three factors, so a partial record could never match anyway.
+     * Also returns active_fingerprint_ids so ESP32 can purge deleted/unassigned templates.
      */
     public function offlineSync()
     {
@@ -398,10 +400,16 @@ class HardwareApiController extends Controller
             ])
             ->values();
 
+        $activeFingerprintIds = Fingerprint::where('status', 'active')
+            ->whereHas('user', fn ($q) => $q->where('status', 'active'))
+            ->pluck('fingerprint_id')
+            ->all();
+
         return response()->json([
-            'status'    => 'success',
-            'synced_at' => now()->toIso8601String(),
-            'data'      => $entries,
+            'status'                 => 'success',
+            'synced_at'              => now()->toIso8601String(),
+            'active_fingerprint_ids' => $activeFingerprintIds,
+            'data'                   => $entries,
         ]);
     }
 

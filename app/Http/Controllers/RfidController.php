@@ -84,12 +84,17 @@ class RfidController extends Controller
         $card->status = 'lost';
         $card->save();
 
+        UserController::notifyDevicesToSync();
+
         return back()->with('warning', "Card {$card->card_uid} reported lost and deactivated.");
     }
 
     public function destroy(RfidCard $card)
     {
         $card->delete();
+
+        UserController::notifyDevicesToSync();
+
         return back()->with('success', 'RFID Card record deleted.');
     }
 }

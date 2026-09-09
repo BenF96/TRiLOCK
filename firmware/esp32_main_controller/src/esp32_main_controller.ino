@@ -63,6 +63,8 @@ void unlockDoor(int durationSeconds);
 void lockDoor();
 void denyAccess();
 void updateStatusLeds();
+bool isRfidCardPresent();
+bool readRfidCard(String &cardUidOut);
 void checkRfidCard();
 void checkFingerprint();
 void checkKeypad();
@@ -79,6 +81,7 @@ void enrollRfidOnSensor(String sessionToken);
 void sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg = "");
 void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode = "");
 void syncOfflineCache();
+void deleteFingerprintFromSensor(int fingerprintId);
 std::vector<int> readCachedFingerprintIds(const char* path);
 void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<int>& newIds);
 bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int &matchedUserId);
@@ -436,6 +439,8 @@ void setup() {
   // VSPI pins with anything else, see Pin Definitions above)
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   rfid.PCD_Init();
+  // Maximize antenna gain (48dB) for highest detection range and reliability with tags/fobs
+  rfid.PCD_SetAntennaGain(MFRC522::RxGain_max);
   // PCD_Init() returns void - it can't tell us whether the reader is actually answering
   // over SPI. Read the version register directly: a real MFRC522 reports 0x91 or 0x92;
   // 0x00 or 0xFF means nothing is responding on the bus (bad wiring/power/CS conflict),
@@ -445,7 +450,7 @@ void setup() {
   if (rfidVersion == 0x00 || rfidVersion == 0xFF) {
     Serial.printf("WARNING: MFRC522 not responding on SPI (VersionReg=0x%02X) - check wiring/power. RFID scanning will not work.\n", rfidVersion);
   } else {
-    Serial.printf("MFRC522 RFID Reader Initialized (VersionReg=0x%02X).\n", rfidVersion);
+    Serial.printf("MFRC522 RFID Reader Initialized (VersionReg=0x%02X, Gain=Max).\n", rfidVersion);
   }
 
   // Initialize Fingerprint Sensor (UART2: RX2=GPIO17 <- sensor TX, TX2=GPIO16 -> sensor RX)
@@ -694,12 +699,26 @@ void checkMfaCompletion() {
 // -------------------------------------------------------------------------------------
 // SENSOR MONITORING & SCANNING
 // -------------------------------------------------------------------------------------
-void checkRfidCard() {
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
-    return;
+// Checks whether an RFID card is in the RF field, responding to both standard REQA
+// and Wake-Up (WUPA) commands to detect previously halted or already-present cards.
+bool isRfidCardPresent() {
+  if (rfid.PICC_IsNewCardPresent()) {
+    return true;
+  }
+  byte bufferATQA[2];
+  byte bufferSize = sizeof(bufferATQA);
+  return (rfid.PICC_WakeupA(bufferATQA, &bufferSize) == MFRC522::STATUS_OK);
+}
+
+// Reads RFID card serial UID, halts card, and stops crypto
+bool readRfidCard(String &cardUidOut) {
+  if (!isRfidCardPresent()) {
+    return false;
+  }
+  if (!rfid.PICC_ReadCardSerial()) {
+    return false;
   }
 
-  // Format Card UID string (e.g. "FA 12 3B 88")
   String cardUid = "";
   for (byte i = 0; i < rfid.uid.size; i++) {
     if (rfid.uid.uidByte[i] < 0x10) cardUid += "0";
@@ -710,6 +729,16 @@ void checkRfidCard() {
 
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
+
+  cardUidOut = cardUid;
+  return true;
+}
+
+void checkRfidCard() {
+  String cardUid = "";
+  if (!readRfidCard(cardUid)) {
+    return;
+  }
 
   currentMfaCardUid = cardUid;
   mfaSessionActive = true;
@@ -847,6 +876,8 @@ void pollEnrollmentCommand() {
         enrollFingerprintOnSensor(String(token));
       } else if (String(cmd) == "rfid") {
         enrollRfidOnSensor(String(token));
+      } else if (String(cmd) == "sync_offline" || String(cmd) == "delete_fingerprint") {
+        syncOfflineCache();
       }
     }
   }
@@ -982,28 +1013,22 @@ void enrollRfidOnSensor(String sessionToken) {
   Serial.println(">>> RFID CARD ENROLLMENT MODE ACTIVATED");
   buzzerPlayNow(SND_REMOTE, NOTE_COUNT(SND_REMOTE));
 
-  unsigned long startMs = millis();
-  while (millis() - startMs < 30000) {
-    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-      String cardUid = "";
-      for (byte i = 0; i < rfid.uid.size; i++) {
-        if (rfid.uid.uidByte[i] < 0x10) cardUid += "0";
-        cardUid += String(rfid.uid.uidByte[i], HEX);
-        if (i < rfid.uid.size - 1) cardUid += " ";
-      }
-      cardUid.toUpperCase();
+  // Re-initialize PCD and boost antenna gain to maximum (48dB)
+  rfid.PCD_Init();
+  rfid.PCD_SetAntennaGain(MFRC522::RxGain_max);
 
+  unsigned long startMs = millis();
+  while (millis() - startMs < 45000) {
+    String cardUid = "";
+    if (readRfidCard(cardUid)) {
       Serial.printf("RFID Card Scanned for Enrollment: %s\n", cardUid.c_str());
       buzzerPlayNow(SND_GRANTED, NOTE_COUNT(SND_GRANTED));
-
-      rfid.PICC_HaltA();
-      rfid.PCD_StopCrypto1();
 
       sendEnrollmentResult("rfid", sessionToken, "success", cardUid, 0);
       return;
     }
-    esp_task_wdt_reset(); // 30s wait, well past the 15s WDT window
-    delay(100);
+    esp_task_wdt_reset(); // 45s wait, feed WDT continuously
+    delay(50);
   }
 
   Serial.println("RFID card enrollment timed out.");
@@ -1290,8 +1315,18 @@ void syncOfflineCache() {
   http.end();
 }
 
-// Reads just the fingerprint_id column out of a cached offline-sync JSON file.
-// Used by syncOfflineCache() to diff the credential set before/after a resync.
+// Deletes a specific fingerprint template model from the AS608 optical sensor flash memory
+void deleteFingerprintFromSensor(int fingerprintId) {
+  if (fingerprintId <= 0) return;
+  uint8_t result = finger.deleteModel(fingerprintId);
+  if (result == FINGERPRINT_OK) {
+    Serial.printf("Fingerprint slot #%d successfully deleted from AS608 sensor.\n", fingerprintId);
+  } else {
+    Serial.printf("Fingerprint slot #%d delete skipped or not found on sensor (code %d).\n", fingerprintId, result);
+  }
+}
+
+// Reads both "active_fingerprint_ids" (all valid system fingerprints) and "data" entries out of offline-sync JSON
 std::vector<int> readCachedFingerprintIds(const char* path) {
   std::vector<int> ids;
   if (!LittleFS.exists(path)) return ids;
@@ -1304,33 +1339,52 @@ std::vector<int> readCachedFingerprintIds(const char* path) {
   f.close();
   if (err) return ids;
 
+  if (doc.containsKey("active_fingerprint_ids")) {
+    JsonArray activeIds = doc["active_fingerprint_ids"].as<JsonArray>();
+    for (int fp : activeIds) {
+      if (fp > 0) ids.push_back(fp);
+    }
+  }
+
   JsonArray entries = doc["data"].as<JsonArray>();
   for (JsonObject entry : entries) {
     int fp = entry["fingerprint_id"] | 0;
-    if (fp > 0) ids.push_back(fp);
+    if (fp > 0) {
+      bool found = false;
+      for (int existing : ids) {
+        if (existing == fp) { found = true; break; }
+      }
+      if (!found) ids.push_back(fp);
+    }
   }
   return ids;
 }
 
 // A user (or just their fingerprint credential) deleted from the dashboard drops out of
-// GET /api/offline-sync on the next resync - RFID and PIN only ever live in that cached
-// JSON, so overwriting it already "deletes" them here. The fingerprint template is the one
-// credential also stored outside that file, in the sensor's own onboard flash by ID, so it
-// needs an explicit finger.deleteModel() or it lingers forever (and keeps occupying one of
-// the sensor's limited 127 slots).
-void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<int>& newIds) {
+// GET /api/offline-sync on the next resync. Purges revoked models from the AS608 sensor.
+void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<int>& activeServerIds) {
+  // 1. Check all previously cached IDs against the active server list
   for (int id : oldIds) {
     bool stillActive = false;
-    for (int n : newIds) {
+    for (int n : activeServerIds) {
       if (n == id) { stillActive = true; break; }
     }
-    if (stillActive) continue;
+    if (!stillActive) {
+      deleteFingerprintFromSensor(id);
+    }
+  }
 
-    uint8_t result = finger.deleteModel(id);
-    if (result == FINGERPRINT_OK) {
-      Serial.printf("Revoked fingerprint ID %d deleted from sensor.\n", id);
-    } else {
-      Serial.printf("Failed to delete revoked fingerprint ID %d from sensor (code %d).\n", id, result);
+  // 2. Hardware scan: check sensor slots (1 to 127). If a slot is loaded but not in activeServerIds, delete it.
+  for (int slot = 1; slot <= 127; slot++) {
+    bool isActive = false;
+    for (int n : activeServerIds) {
+      if (n == slot) { isActive = true; break; }
+    }
+    if (!isActive) {
+      if (finger.loadModel(slot) == FINGERPRINT_OK) {
+        Serial.printf("Found orphan/deleted fingerprint slot #%d on sensor - purging...\n", slot);
+        deleteFingerprintFromSensor(slot);
+      }
     }
   }
 }
@@ -1588,7 +1642,7 @@ void sendHeartbeat() {
   int code = http.POST(jsonPayload);
   if (code == 200) {
     String response = http.getString();
-    StaticJsonDocument<256> respDoc;
+    StaticJsonDocument<512> respDoc;
     deserializeJson(respDoc, response);
 
     const char* pendingCmd = respDoc["pending_command"];
@@ -1600,6 +1654,19 @@ void sendHeartbeat() {
     } else if (pendingCmd && String(pendingCmd) == "lock") {
       Serial.println(">>> CLOUD REMOTE LOCK COMMAND RECEIVED!");
       lockDoor();
+    } else if (pendingCmd && (String(pendingCmd) == "sync_offline" || String(pendingCmd) == "delete_fingerprint")) {
+      Serial.println(">>> CLOUD SYNC/DELETE CREDENTIAL COMMAND RECEIVED!");
+      if (respDoc.containsKey("deleted_fingerprint_ids")) {
+        JsonArray delArr = respDoc["deleted_fingerprint_ids"].as<JsonArray>();
+        for (int delId : delArr) {
+          deleteFingerprintFromSensor(delId);
+        }
+      }
+      if (respDoc.containsKey("fingerprint_id")) {
+        int delId = respDoc["fingerprint_id"] | 0;
+        deleteFingerprintFromSensor(delId);
+      }
+      syncOfflineCache();
     }
     Serial.println("Heartbeat synchronized with Cloud Server (HTTP 200)");
   } else if (code > 0) {

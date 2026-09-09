@@ -6,8 +6,11 @@ use Illuminate\Http\Request;
 use App\Models\User;
 use App\Models\RfidCard;
 use App\Models\Fingerprint;
+use App\Models\Device;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
 
 class UserController extends Controller
 {
@@ -147,14 +150,34 @@ class UserController extends Controller
         $user->status = ($user->status === 'active') ? 'inactive' : 'active';
         $user->save();
 
+        self::notifyDevicesToSync();
+
         return back()->with('success', "Status for {$user->full_name} set to {$user->status}.");
     }
 
     public function destroy(User $user)
     {
         $name = $user->full_name;
+        $deletedFingerprintIds = $user->fingerprints()->pluck('fingerprint_id')->all();
         $user->delete();
 
+        self::notifyDevicesToSync($deletedFingerprintIds);
+
         return redirect()->route('users.index')->with('success', "User {$name} deleted.");
+    }
+
+    public static function notifyDevicesToSync(array $deletedFingerprintIds = []): void
+    {
+        try {
+            $devices = Device::where('device_type', 'esp32_main')->get();
+            foreach ($devices as $device) {
+                Cache::put("trilock_pending_command_{$device->id}", [
+                    'command'                 => 'sync_offline',
+                    'deleted_fingerprint_ids' => $deletedFingerprintIds,
+                ], 300);
+            }
+        } catch (\Throwable $e) {
+            Log::warning("Failed to queue device sync: {$e->getMessage()}");
+        }
     }
 }

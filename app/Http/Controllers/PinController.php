@@ -46,12 +46,17 @@ class PinController extends Controller
         $pin->status = ($pin->status === 'active') ? 'disabled' : 'active';
         $pin->save();
 
+        UserController::notifyDevicesToSync();
+
         return back()->with('success', "PIN status set to {$pin->status}.");
     }
 
     public function destroy(AccessPin $pin)
     {
         $pin->delete();
+
+        UserController::notifyDevicesToSync();
+
         return back()->with('success', 'PIN removed successfully.');
     }
 }
