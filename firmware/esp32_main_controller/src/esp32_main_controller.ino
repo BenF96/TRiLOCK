@@ -79,6 +79,8 @@ void enrollRfidOnSensor(String sessionToken);
 void sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg = "");
 void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode = "");
 void syncOfflineCache();
+std::vector<int> readCachedFingerprintIds(const char* path);
+void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<int>& newIds);
 bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int &matchedUserId);
 void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId);
 void flushOfflineQueue();
@@ -210,7 +212,12 @@ bool keyBlinkActive = false;
 #define RST_PIN         4   // MFRC522 RFID Reset Pin
 #define RELAY_PIN       13  // Solenoid Lock Relay Control Pin (Active LOW/HIGH)
 #define BUZZER_PIN      15  // Piezo Buzzer Pin
-#define LED_GREEN       2   // Status LED Green (Access Granted)
+// Was GPIO2 - that's SS_PIN above (MFRC522 chip-select). Sharing it with the LED meant
+// every digitalWrite(LED_GREEN, ...) toggled the RFID reader's SPI CS line as a side
+// effect outside the MFRC522 library's control, corrupting SPI transactions and making
+// card scans unreliable/fail. Moved to GPIO21 - free, not a boot-strapping pin, and not
+// used anywhere else in this pin map. Requires moving the physical LED wire to match.
+#define LED_GREEN       21  // Status LED Green (Access Granted)
 #define LED_RED         22  // Status LED Red (Access Denied)
 
 // No magnetic door contact sensor on this build. GPIO23 is free (unused by anything
@@ -429,7 +436,17 @@ void setup() {
   // VSPI pins with anything else, see Pin Definitions above)
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   rfid.PCD_Init();
-  Serial.println("MFRC522 RFID Reader Initialized.");
+  // PCD_Init() returns void - it can't tell us whether the reader is actually answering
+  // over SPI. Read the version register directly: a real MFRC522 reports 0x91 or 0x92;
+  // 0x00 or 0xFF means nothing is responding on the bus (bad wiring/power/CS conflict),
+  // so this is the one line that actually confirms the reader is alive, not just that
+  // PCD_Init() was called.
+  byte rfidVersion = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  if (rfidVersion == 0x00 || rfidVersion == 0xFF) {
+    Serial.printf("WARNING: MFRC522 not responding on SPI (VersionReg=0x%02X) - check wiring/power. RFID scanning will not work.\n", rfidVersion);
+  } else {
+    Serial.printf("MFRC522 RFID Reader Initialized (VersionReg=0x%02X).\n", rfidVersion);
+  }
 
   // Initialize Fingerprint Sensor (UART2: RX2=GPIO17 <- sensor TX, TX2=GPIO16 -> sensor RX)
   mySerial.begin(57600, SERIAL_8N1, 17, 16);
@@ -1242,6 +1259,11 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
 void syncOfflineCache() {
   if (WiFi.status() != WL_CONNECTED) return;
 
+  // Snapshot which fingerprint IDs are currently trusted BEFORE we overwrite the cache -
+  // this is the only way to tell which ones just got revoked (user/credential deleted
+  // from the dashboard) once the fresh list comes back.
+  std::vector<int> oldFingerprintIds = readCachedFingerprintIds(OFFLINE_CACHE_PATH);
+
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/offline-sync";
   http.begin(url);
@@ -1256,6 +1278,9 @@ void syncOfflineCache() {
       http.writeToStream(&f);
       f.close();
       Serial.println("Offline credential cache synced to flash.");
+
+      std::vector<int> newFingerprintIds = readCachedFingerprintIds(OFFLINE_CACHE_PATH);
+      purgeRevokedFingerprints(oldFingerprintIds, newFingerprintIds);
     } else {
       Serial.println("Failed to open offline cache file for writing.");
     }
@@ -1263,6 +1288,51 @@ void syncOfflineCache() {
     Serial.printf("Offline cache sync failed (HTTP %d), keeping previous cache.\n", code);
   }
   http.end();
+}
+
+// Reads just the fingerprint_id column out of a cached offline-sync JSON file.
+// Used by syncOfflineCache() to diff the credential set before/after a resync.
+std::vector<int> readCachedFingerprintIds(const char* path) {
+  std::vector<int> ids;
+  if (!LittleFS.exists(path)) return ids;
+
+  File f = LittleFS.open(path, "r");
+  if (!f) return ids;
+
+  DynamicJsonDocument doc(OFFLINE_CACHE_DOC_SIZE);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return ids;
+
+  JsonArray entries = doc["data"].as<JsonArray>();
+  for (JsonObject entry : entries) {
+    int fp = entry["fingerprint_id"] | 0;
+    if (fp > 0) ids.push_back(fp);
+  }
+  return ids;
+}
+
+// A user (or just their fingerprint credential) deleted from the dashboard drops out of
+// GET /api/offline-sync on the next resync - RFID and PIN only ever live in that cached
+// JSON, so overwriting it already "deletes" them here. The fingerprint template is the one
+// credential also stored outside that file, in the sensor's own onboard flash by ID, so it
+// needs an explicit finger.deleteModel() or it lingers forever (and keeps occupying one of
+// the sensor's limited 127 slots).
+void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<int>& newIds) {
+  for (int id : oldIds) {
+    bool stillActive = false;
+    for (int n : newIds) {
+      if (n == id) { stillActive = true; break; }
+    }
+    if (stillActive) continue;
+
+    uint8_t result = finger.deleteModel(id);
+    if (result == FINGERPRINT_OK) {
+      Serial.printf("Revoked fingerprint ID %d deleted from sensor.\n", id);
+    } else {
+      Serial.printf("Failed to delete revoked fingerprint ID %d from sensor (code %d).\n", id, result);
+    }
+  }
 }
 
 // Checks a collected RFID+fingerprint+PIN combo against the cached offline credential
