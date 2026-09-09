@@ -261,6 +261,12 @@ unsigned long lastSettingsRefreshMs = 0;
 unsigned long lastOfflineSyncMs = 0;
 unsigned long lastOfflineFlushMs = 0;
 
+// Tracks whether the offline access-event queue file currently has anything in it, kept
+// in RAM so flushOfflineQueue() can skip touching LittleFS entirely on its (common) empty
+// case - LittleFS.exists()/open() on a missing path logs a VFS-level error every time,
+// which would otherwise spam the serial log every OFFLINE_QUEUE_FLUSH_INTERVAL_MS.
+bool offlineQueuePending = false;
+
 // -------------------------------------------------------------------------------------
 // BUZZER SUBSYSTEM
 // -------------------------------------------------------------------------------------
@@ -439,6 +445,9 @@ void setup() {
   if (!LittleFS.begin(true)) {
     Serial.println("Warning: LittleFS mount failed - offline unlock will be unavailable.");
   }
+  // One-time check (a repeated exists()/open() on a missing path logs VFS noise, so this
+  // is deliberately done once at boot rather than on every flushOfflineQueue() tick).
+  offlineQueuePending = LittleFS.exists(OFFLINE_QUEUE_PATH);
 
   // Connect to Wi-Fi Network
   connectWiFi();
@@ -519,22 +528,33 @@ void loop() {
   // 7. Handle inbound remote unlock commands from the Laravel backend
   checkRemoteUnlockServer();
 
+  // Every task below makes a blocking HTTP call that can take up to a few seconds on a
+  // slow/cold server - and loop() is single-threaded, so checkKeypad()/checkRfidCard()/
+  // checkFingerprint() simply don't run again until whichever call is in flight returns.
+  // A keypress landing mid-call feels like the keypad "took long" to register. None of
+  // these background syncs are time-critical to the second, so defer (not skip - the
+  // interval timestamp is only updated once the call actually runs) all of them while
+  // someone is actively mid-scan, so a live PIN/RFID/fingerprint entry never gets stalled
+  // by a background poll. Each resumes on the very next loop() pass once the interaction
+  // ends (granted, denied, or timed out), not after waiting a full new interval.
+  bool userInteracting = mfaSessionActive || pinEntryActive;
+
   // 7. Periodic device heartbeat (every 30s)
-  if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+  if (!userInteracting && millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatMs = millis();
     sendHeartbeat();
     esp_task_wdt_reset(); // re-feed in case the call above blocked for a while
   }
 
   // 8. Periodic settings refresh (every 60s)
-  if (millis() - lastSettingsRefreshMs >= SETTINGS_REFRESH_INTERVAL_MS) {
+  if (!userInteracting && millis() - lastSettingsRefreshMs >= SETTINGS_REFRESH_INTERVAL_MS) {
     lastSettingsRefreshMs = millis();
     fetchServerSettings();
     esp_task_wdt_reset();
   }
 
   // 8b. Periodic offline credential cache refresh (every 5 min, while online)
-  if (millis() - lastOfflineSyncMs >= OFFLINE_SYNC_INTERVAL_MS) {
+  if (!userInteracting && millis() - lastOfflineSyncMs >= OFFLINE_SYNC_INTERVAL_MS) {
     lastOfflineSyncMs = millis();
     syncOfflineCache();
     esp_task_wdt_reset();
@@ -543,15 +563,16 @@ void loop() {
   // 8c. Periodic offline access-event queue flush (every 45s, while online) - backfills
   // any door unlocks that were granted from the local cache while the server was
   // unreachable, so they still show up in the dashboard once connectivity returns.
-  if (millis() - lastOfflineFlushMs >= OFFLINE_QUEUE_FLUSH_INTERVAL_MS) {
+  if (!userInteracting && millis() - lastOfflineFlushMs >= OFFLINE_QUEUE_FLUSH_INTERVAL_MS) {
     lastOfflineFlushMs = millis();
     flushOfflineQueue();
     esp_task_wdt_reset();
   }
 
-  // 9. Poll server for pending enrollment commands (every 3s)
+  // 9. Poll server for pending enrollment commands (every 3s) - by far the most frequent
+  // background call, and so the dominant source of keypad lag before this guard.
   static unsigned long lastEnrollPollMs = 0;
-  if (millis() - lastEnrollPollMs >= 3000) {
+  if (!userInteracting && millis() - lastEnrollPollMs >= 3000) {
     lastEnrollPollMs = millis();
     pollEnrollmentCommand();
     esp_task_wdt_reset();
@@ -1291,7 +1312,7 @@ bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int
 // flash usage unboundedly if the device stays offline for a long stretch.
 void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
   int queuedCount = 0;
-  if (LittleFS.exists(OFFLINE_QUEUE_PATH)) {
+  if (offlineQueuePending) {
     File countFile = LittleFS.open(OFFLINE_QUEUE_PATH, "r");
     if (countFile) {
       while (countFile.available()) {
@@ -1319,6 +1340,7 @@ void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
   serializeJson(doc, f);
   f.println();
   f.close();
+  offlineQueuePending = true;
 
   Serial.printf("Queued offline access event for backfill sync (user_id=%d).\n", userId);
 }
@@ -1327,11 +1349,11 @@ void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
 // entries front-to-back and stops at the first failure, rewriting the queue file to keep
 // only what's left unsent - so a mid-flush disconnect doesn't lose or duplicate events.
 void flushOfflineQueue() {
+  if (!offlineQueuePending) return; // nothing queued - skip touching LittleFS at all
   if (WiFi.status() != WL_CONNECTED) return;
-  if (!LittleFS.exists(OFFLINE_QUEUE_PATH)) return;
 
   File f = LittleFS.open(OFFLINE_QUEUE_PATH, "r");
-  if (!f) return;
+  if (!f) { offlineQueuePending = false; return; } // file vanished unexpectedly - resync the flag
 
   std::vector<String> lines;
   while (f.available()) {
@@ -1343,6 +1365,7 @@ void flushOfflineQueue() {
 
   if (lines.empty()) {
     LittleFS.remove(OFFLINE_QUEUE_PATH);
+    offlineQueuePending = false;
     return;
   }
 
@@ -1380,12 +1403,14 @@ void flushOfflineQueue() {
 
   if (sentCount >= lines.size()) {
     LittleFS.remove(OFFLINE_QUEUE_PATH);
+    offlineQueuePending = false;
     Serial.println("Offline access queue fully synced to server.");
     return;
   }
 
   File out = LittleFS.open(OFFLINE_QUEUE_PATH, "w");
   if (!out) return;
+  offlineQueuePending = true; // still has unsent entries
   for (size_t i = sentCount; i < lines.size(); i++) {
     out.println(lines[i]);
   }
