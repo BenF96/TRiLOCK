@@ -23,6 +23,10 @@ Route::middleware(['throttle:hardware-api', 'device.auth'])->group(function () {
     Route::post('/door-status',[HardwareApiController::class, 'updateDoorStatus']);
     Route::post('/heartbeat',  [HardwareApiController::class, 'heartbeat']);
 
+    // Backfills a door unlock that was granted from the device's local offline cache
+    // (server was unreachable at the time) once connectivity returns.
+    Route::post('/access/offline-log', [HardwareApiController::class, 'logOfflineAccess']);
+
     // Media upload
     Route::post('/upload-image',[HardwareApiController::class, 'uploadImage']);
 

@@ -31,6 +31,12 @@
  *   completes all three factors is checked against this local cache instead - same
  *   security bar as online (all 3 factors, one user), just verified on-device. Requires
  *   OFFLINE_PIN_SALT below to exactly match TRILOCK_OFFLINE_PIN_SALT in the server's .env.
+ *   The door unlocks immediately either way, but an offline grant is queued to flash
+ *   and backfilled to POST /api/access/offline-log once the server is reachable again -
+ *   see queueOfflineAccessEvent()/flushOfflineQueue() - so it still reaches the dashboard.
+ *   No photo is attached to a backfilled event: the ESP32-CAM only captures in real time
+ *   off a live serial trigger, and by the time connectivity returns there's no one at the
+ *   door left to photograph.
  * =====================================================================================
  */
 
@@ -46,6 +52,7 @@
 #include <esp_task_wdt.h>    // ESP32 Hardware Task Watchdog Timer
 #include <LittleFS.h>        // On-flash cache for offline credential verification
 #include <mbedtls/md.h>      // SHA-256 for offline PIN hashing (bundled with ESP32 core)
+#include <vector>            // Offline access-event queue flush (flushOfflineQueue())
 
 #define WDT_TIMEOUT_SECONDS 15
 
@@ -72,7 +79,9 @@ void enrollRfidOnSensor(String sessionToken);
 void sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg = "");
 void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode = "");
 void syncOfflineCache();
-bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode);
+bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int &matchedUserId);
+void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId);
+void flushOfflineQueue();
 String sha256Hex(String input);
 void fetchServerSettings();
 void sendDoorStatusUpdate(String status, String remarks);
@@ -122,6 +131,19 @@ const int DEVICE_ID       = 4; // Device ID in TRILOCK database
 #define OFFLINE_CACHE_PATH        "/offline_cache.json"
 #define OFFLINE_SYNC_INTERVAL_MS  300000  // Re-sync every 5 minutes while online
 #define OFFLINE_CACHE_DOC_SIZE    24576   // ~24KB - fits a few hundred synced users
+
+// -------------------------------------------------------------------------------------
+// OFFLINE ACCESS EVENT QUEUE (backfill sync)
+// -------------------------------------------------------------------------------------
+// Every offline-granted unlock (server unreachable at the time) is appended here as one
+// JSON line, then flushed to POST /api/access/offline-log once the server is reachable
+// again - otherwise the event would unlock the door but never appear on the dashboard.
+// No photo is captured for these: the capture window is real-time only (the CAM is
+// triggered by a live serial command tied to the person standing at the door), so by the
+// time connectivity returns and the event backfills, there is no one left to photograph.
+#define OFFLINE_QUEUE_PATH         "/offline_queue.jsonl"
+#define OFFLINE_QUEUE_MAX_ENTRIES  50     // Bound flash usage if the device stays offline a long time
+#define OFFLINE_QUEUE_FLUSH_INTERVAL_MS 45000
 
 // -------------------------------------------------------------------------------------
 // 4×3 MATRIX KEYPAD
@@ -237,6 +259,7 @@ bool ledRedActive = false;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastSettingsRefreshMs = 0;
 unsigned long lastOfflineSyncMs = 0;
+unsigned long lastOfflineFlushMs = 0;
 
 // -------------------------------------------------------------------------------------
 // BUZZER SUBSYSTEM
@@ -432,6 +455,7 @@ void setup() {
   // Stamp initial timers so the first periodic task fires after the interval, not immediately
   lastHeartbeatMs      = millis();
   lastSettingsRefreshMs = millis();
+  lastOfflineFlushMs    = millis();
 
   // Initialize Hardware Task Watchdog Timer (15s timeout).
   // esp_task_wdt_init()'s signature changed between ESP32 Arduino core versions: core 2.x
@@ -513,6 +537,15 @@ void loop() {
   if (millis() - lastOfflineSyncMs >= OFFLINE_SYNC_INTERVAL_MS) {
     lastOfflineSyncMs = millis();
     syncOfflineCache();
+    esp_task_wdt_reset();
+  }
+
+  // 8c. Periodic offline access-event queue flush (every 45s, while online) - backfills
+  // any door unlocks that were granted from the local cache while the server was
+  // unreachable, so they still show up in the dashboard once connectivity returns.
+  if (millis() - lastOfflineFlushMs >= OFFLINE_QUEUE_FLUSH_INTERVAL_MS) {
+    lastOfflineFlushMs = millis();
+    flushOfflineQueue();
     esp_task_wdt_reset();
   }
 
@@ -1163,10 +1196,15 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     ? "Server unreachable - checking offline credential cache..."
     : "WiFi disconnected - checking offline credential cache...");
 
-  if (method == "multi_factor" && attemptOfflineUnlock(cardUid, fingerprintId, pinCode)) {
+  int offlineUserId = 0;
+  if (method == "multi_factor" && attemptOfflineUnlock(cardUid, fingerprintId, pinCode, offlineUserId)) {
     Serial.println(">>> OFFLINE ACCESS GRANTED (matched local cache) <<<");
     buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
     unlockDoor(doorUnlockDuration); // last value fetched from /api/settings while online
+    // No live server round-trip happened, so this event never reached the dashboard and
+    // no CAPTURE was sent (no access_log_id to attach a photo to). Queue it for backfill
+    // sync so it still shows up once the server is reachable again.
+    queueOfflineAccessEvent(offlineUserId, cardUid, fingerprintId);
   } else {
     Serial.println("OFFLINE ACCESS DENIED - no matching cached credential set.");
     denyAccess();
@@ -1209,7 +1247,8 @@ void syncOfflineCache() {
 // Checks a collected RFID+fingerprint+PIN combo against the cached offline credential
 // list. All three must be present and match the same synced entry - never a partial
 // (single-factor) match, matching the server's online multi_factor rule.
-bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode) {
+bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int &matchedUserId) {
+  matchedUserId = 0;
   if (cardUid.length() == 0 || fingerprintId <= 0 || pinCode.length() == 0) return false;
 
   if (!LittleFS.exists(OFFLINE_CACHE_PATH)) {
@@ -1239,10 +1278,119 @@ bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode) {
     if (cardUid.equalsIgnoreCase(eCardUid) &&
         fingerprintId == eFinger &&
         pinHashHex.equalsIgnoreCase(ePinHash)) {
+      matchedUserId = entry["user_id"] | 0;
       return true;
     }
   }
   return false;
+}
+
+// Appends one offline-granted access event to the backfill queue (JSON Lines - one
+// compact object per line, so appending never needs to parse/rewrite the whole file).
+// Silently drops the event once OFFLINE_QUEUE_MAX_ENTRIES is reached rather than growing
+// flash usage unboundedly if the device stays offline for a long stretch.
+void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
+  int queuedCount = 0;
+  if (LittleFS.exists(OFFLINE_QUEUE_PATH)) {
+    File countFile = LittleFS.open(OFFLINE_QUEUE_PATH, "r");
+    if (countFile) {
+      while (countFile.available()) {
+        if (countFile.readStringUntil('\n').length() > 0) queuedCount++;
+      }
+      countFile.close();
+    }
+  }
+
+  if (queuedCount >= OFFLINE_QUEUE_MAX_ENTRIES) {
+    Serial.println("Offline access queue full - dropping event (will not appear on dashboard).");
+    return;
+  }
+
+  File f = LittleFS.open(OFFLINE_QUEUE_PATH, "a");
+  if (!f) {
+    Serial.println("Failed to open offline access queue for append!");
+    return;
+  }
+
+  StaticJsonDocument<192> doc;
+  doc["user_id"] = userId;
+  doc["card_uid"] = cardUid;
+  doc["fingerprint_id"] = fingerprintId;
+  serializeJson(doc, f);
+  f.println();
+  f.close();
+
+  Serial.printf("Queued offline access event for backfill sync (user_id=%d).\n", userId);
+}
+
+// Flushes the offline access-event queue to POST /api/access/offline-log. Processes
+// entries front-to-back and stops at the first failure, rewriting the queue file to keep
+// only what's left unsent - so a mid-flush disconnect doesn't lose or duplicate events.
+void flushOfflineQueue() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!LittleFS.exists(OFFLINE_QUEUE_PATH)) return;
+
+  File f = LittleFS.open(OFFLINE_QUEUE_PATH, "r");
+  if (!f) return;
+
+  std::vector<String> lines;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) lines.push_back(line);
+  }
+  f.close();
+
+  if (lines.empty()) {
+    LittleFS.remove(OFFLINE_QUEUE_PATH);
+    return;
+  }
+
+  size_t sentCount = 0;
+  for (; sentCount < lines.size(); sentCount++) {
+    StaticJsonDocument<192> doc;
+    if (deserializeJson(doc, lines[sentCount])) continue; // corrupt line - skip, don't block the rest
+
+    HTTPClient http;
+    http.begin(String(SERVER_URL) + "/api/access/offline-log");
+    http.setTimeout(BACKGROUND_HTTP_TIMEOUT_MS);
+    http.addHeader("X-Device-Token", DEVICE_API_KEY);
+    http.addHeader("Accept", "application/json");
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<192> payload;
+    payload["device_id"] = DEVICE_ID;
+    payload["user_id"] = doc["user_id"] | 0;
+    payload["card_uid"] = doc["card_uid"] | "";
+    payload["fingerprint_id"] = doc["fingerprint_id"] | 0;
+
+    String jsonPayload;
+    serializeJson(payload, jsonPayload);
+
+    int code = http.POST(jsonPayload);
+    http.end();
+
+    if (code != 200) {
+      Serial.printf("Offline queue flush stopped: entry %u failed (HTTP %d). Will retry next cycle.\n", (unsigned)sentCount, code);
+      break; // stop here - keep this entry and everything after it queued for next time
+    }
+  }
+
+  if (sentCount == 0) return; // nothing sent, nothing to rewrite
+
+  if (sentCount >= lines.size()) {
+    LittleFS.remove(OFFLINE_QUEUE_PATH);
+    Serial.println("Offline access queue fully synced to server.");
+    return;
+  }
+
+  File out = LittleFS.open(OFFLINE_QUEUE_PATH, "w");
+  if (!out) return;
+  for (size_t i = sentCount; i < lines.size(); i++) {
+    out.println(lines[i]);
+  }
+  out.close();
+  Serial.printf("Offline access queue: synced %u, %u still pending.\n", (unsigned)sentCount, (unsigned)(lines.size() - sentCount));
 }
 
 // SHA-256 of `input`, lowercase hex - must match Laravel's hash('sha256', $pin.$salt).

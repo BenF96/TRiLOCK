@@ -126,4 +126,44 @@ class HardwareApiTest extends TestCase
                 'status' => 'success',
             ]);
     }
+
+    public function test_offline_access_backfill_logs_event_without_reauthorizing()
+    {
+        $card = RfidCard::where('status', 'active')->first();
+
+        $response = $this->postJson('/api/access/offline-log', [
+            'device_id'      => 1,
+            'user_id'        => $card->user_id,
+            'card_uid'       => $card->card_uid,
+            'fingerprint_id' => 1,
+        ]);
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'status' => 'success',
+            ])
+            ->assertJsonStructure([
+                'status',
+                'access_log_id',
+            ]);
+
+        $this->assertDatabaseHas('access_logs', [
+            'id'                     => $response->json('access_log_id'),
+            'user_id'                => $card->user_id,
+            'authentication_method'  => 'multi_factor_offline',
+            'access_type'            => 'entry',
+            'door_status'            => 'unlocked',
+            'captured_image'         => null,
+        ]);
+    }
+
+    public function test_offline_access_backfill_rejects_unknown_user()
+    {
+        $response = $this->postJson('/api/access/offline-log', [
+            'device_id' => 1,
+            'user_id'   => 999999,
+        ]);
+
+        $response->assertStatus(422);
+    }
 }

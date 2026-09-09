@@ -86,7 +86,7 @@
                                 <span class="text-xs text-slate-400 font-mono">{{ $log->user ? $log->user->employee_student_id : 'Unknown' }}</span>
                             </td>
                             <td class="py-3.5 px-3 text-xs font-mono text-slate-300 capitalize">{{ $log->user ? $log->user->role : 'N/A' }}</td>
-                            <td class="py-3.5 px-3 text-xs font-semibold text-cyan-400 uppercase font-mono">{{ $log->authentication_method === 'multi_factor' ? 'RFID + FP + PIN' : str_replace('_', ' ', $log->authentication_method) }}</td>
+                            <td class="py-3.5 px-3 text-xs font-semibold text-cyan-400 uppercase font-mono">{{ $log->authentication_method === 'multi_factor' ? 'RFID + FP + PIN' : ($log->authentication_method === 'multi_factor_offline' ? 'RFID + FP + PIN (Offline)' : str_replace('_', ' ', $log->authentication_method)) }}</td>
                             <td class="py-3.5 px-3">
                                 <span class="px-2.5 py-1 rounded-lg text-xs font-bold uppercase {{ $log->access_type === 'entry' ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30' : 'bg-rose-500/15 text-rose-300 border border-rose-500/30' }}">
                                     {{ $log->access_type }}

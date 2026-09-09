@@ -195,7 +195,7 @@
                                     </div>
                                 </td>
                                 <td class="py-3.5 px-3">
-                                    <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-mono font-semibold border {{ $log->authentication_method === 'multi_factor' ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30' : ($log->authentication_method === 'rfid' ? 'bg-blue-500/10 text-blue-300 border-blue-500/30' : ($log->authentication_method === 'fingerprint' ? 'bg-purple-500/10 text-purple-300 border-purple-500/30' : ($log->authentication_method === 'pin' ? 'bg-amber-500/10 text-amber-300 border-amber-500/30' : ($log->authentication_method === 'rfid_fingerprint' ? 'bg-teal-500/10 text-teal-300 border-teal-500/30' : 'bg-rose-500/10 text-rose-300 border-rose-500/30')))) }}">
+                                    <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-mono font-semibold border {{ $log->authentication_method === 'multi_factor' ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30' : ($log->authentication_method === 'multi_factor_offline' ? 'bg-orange-500/10 text-orange-300 border-orange-500/30' : ($log->authentication_method === 'rfid' ? 'bg-blue-500/10 text-blue-300 border-blue-500/30' : ($log->authentication_method === 'fingerprint' ? 'bg-purple-500/10 text-purple-300 border-purple-500/30' : ($log->authentication_method === 'pin' ? 'bg-amber-500/10 text-amber-300 border-amber-500/30' : ($log->authentication_method === 'rfid_fingerprint' ? 'bg-teal-500/10 text-teal-300 border-teal-500/30' : 'bg-rose-500/10 text-rose-300 border-rose-500/30'))))) }}">
                                         @if($log->authentication_method === 'rfid')
                                             <i class="fa-solid fa-id-card mr-1 text-[10px]"></i> RFID
                                         @elseif($log->authentication_method === 'fingerprint')
@@ -204,6 +204,8 @@
                                             <i class="fa-solid fa-hashtag mr-1 text-[10px]"></i> Keypad PIN
                                         @elseif($log->authentication_method === 'multi_factor')
                                             <i class="fa-solid fa-shield-halved mr-1 text-[10px]"></i> Multi-Factor
+                                        @elseif($log->authentication_method === 'multi_factor_offline')
+                                            <i class="fa-solid fa-plug-circle-xmark mr-1 text-[10px]"></i> Multi-Factor (Offline)
                                         @else
                                             {{ str_replace('_', ' + ', $log->authentication_method) }}
                                         @endif

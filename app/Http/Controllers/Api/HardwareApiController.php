@@ -244,6 +244,55 @@ class HardwareApiController extends Controller
     }
 
     /**
+     * POST /api/access/offline-log
+     * Backfills a door unlock that the ESP32 main controller already granted locally
+     * (matched against its cached RFID+fingerprint+PIN combo) while the server was
+     * unreachable. The access decision was already made on-device at the same security
+     * bar as the online path - this endpoint only records it so it appears on the
+     * dashboard; it never re-authorizes. No image: the capture window is real-time only,
+     * and by the time this backfills there's no one left at the door to photograph.
+     */
+    public function logOfflineAccess(Request $request)
+    {
+        $validated = $request->validate([
+            'device_id'      => 'required|integer',
+            'user_id'        => 'required|integer|exists:users,id',
+            'card_uid'       => 'nullable|string',
+            'fingerprint_id' => 'nullable|integer',
+        ]);
+
+        $user = User::find($validated['user_id']);
+
+        $this->touchDevice($validated['device_id'], $request->ip());
+
+        $log = AccessLog::create([
+            'user_id'               => $user->id,
+            'authentication_method' => 'multi_factor_offline',
+            'access_type'           => 'entry',
+            'captured_image'        => null,
+            'door_status'           => 'unlocked',
+            'date'                  => now()->toDateString(),
+            'time'                  => now()->toTimeString(),
+            'device_id'             => $validated['device_id'],
+        ]);
+
+        DoorLog::create([
+            'status'    => 'unlocked',
+            'opened_at' => now(),
+            'closed_at' => null,
+            'locked_at' => null,
+            'remarks'   => "ESP32 API: Backfilled OFFLINE multi_factor access for {$user->full_name} " .
+                            "(granted on-device from cached credentials while server was unreachable; no photo captured)",
+        ]);
+
+        return response()->json([
+            'status'        => 'success',
+            'message'       => 'Offline access event logged',
+            'access_log_id' => $log->id,
+        ]);
+    }
+
+    /**
      * POST /api/upload-image
      * ESP32-CAM uploads captured image JPG file
      */
