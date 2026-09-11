@@ -29,7 +29,10 @@ class DashboardController extends Controller
         $currentDoorStatus = $latestDoorLog ? $latestDoorLog->status : 'locked';
 
         $devicesCount = Device::count();
-        $onlineDevicesCount = Device::where('status', 'online')->count();
+        // Computed via isOnline() (last_seen vs. threshold), not the `status` column —
+        // that column is only write-through and goes stale the moment a device drops
+        // off between heartbeats. See Device::isOnline() doc-comment.
+        $onlineDevicesCount = Device::all()->filter->isOnline()->count();
 
         $recentAccessLogs = AccessLog::with('user')
             ->orderBy('created_at', 'desc')

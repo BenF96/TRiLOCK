@@ -47,14 +47,14 @@
         </div>
 
         <!-- Active Devices -->
-        <div class="p-5 rounded-2xl glass-card glass-card-hover relative overflow-hidden group">
+        <div class="p-5 rounded-2xl glass-card glass-card-hover relative overflow-hidden group" x-data="{ devicesTotal: {{ $devicesCount }} }">
             <div class="absolute top-0 right-0 w-28 h-28 bg-blue-500/10 rounded-full blur-2xl group-hover:bg-blue-500/20 transition duration-500"></div>
             <div class="flex items-center justify-between relative z-10">
                 <div>
                     <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">ESP32 Online</p>
                     <h3 class="text-3xl font-black text-blue-400 mt-1 tracking-tight">
-                        {{ number_format($onlineDevicesCount) }}
-                        <span class="text-sm font-semibold text-slate-500 font-mono">/ {{ $devicesCount }}</span>
+                        <span x-text="$store.hardware.devices.length ? $store.hardware.onlineCount() : {{ $onlineDevicesCount }}"></span>
+                        <span class="text-sm font-semibold text-slate-500 font-mono">/ <span x-text="$store.hardware.devices.length ? $store.hardware.devices.length : devicesTotal"></span></span>
                     </h3>
                     <div class="flex items-center gap-1.5 mt-2">
                         <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-blue-500/15 text-blue-300 border border-blue-500/30">

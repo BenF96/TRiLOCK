@@ -223,11 +223,13 @@ bool keyBlinkActive = false;
 #define LED_GREEN       21  // Status LED Green (Access Granted)
 #define LED_RED         22  // Status LED Red (Access Denied)
 
-// No magnetic door contact sensor on this build. GPIO23 is free (unused by anything
-// else in this pin map) if you add one later — set HAS_DOOR_SENSOR to 1 and wire the
-// reed switch to it to enable door-ajar monitoring (see checkDoorSensor()/checkDoorAjar()).
+// No magnetic door contact sensor on this build. GPIO23 is NOT free - it's MOSI_PIN
+// above, shared with the RFID reader's SPI bus - so the door sensor uses GPIO5 instead
+// (unused anywhere else in this pin map). If you add one later, set HAS_DOOR_SENSOR to 1
+// and wire the reed switch to GPIO5 to enable door-ajar monitoring (see
+// checkDoorSensor()/checkDoorAjar()).
 #define HAS_DOOR_SENSOR  0
-#define DOOR_SENSOR_PIN  23 // Only read when HAS_DOOR_SENSOR is 1 — currently unused
+#define DOOR_SENSOR_PIN  5  // Only read when HAS_DOOR_SENSOR is 1 — currently unused
 
 // Buzzer Behaviour
 #define BUZZER_IS_ACTIVE     0     // 0 = passive piezo (PWM tones), 1 = active buzzer (on/off)
@@ -547,10 +549,7 @@ void loop() {
   // 6. Poll the 4×3 matrix keypad for PIN entry
   checkKeypad();
 
-  // 7. Handle inbound remote unlock commands from the Laravel backend
-  checkRemoteUnlockServer();
-
-  // Every task below makes a blocking HTTP call that can take up to a few seconds on a
+  // Every task below makes a blocking call that can take up to a few seconds on a
   // slow/cold server - and loop() is single-threaded, so checkKeypad()/checkRfidCard()/
   // checkFingerprint() simply don't run again until whichever call is in flight returns.
   // A keypress landing mid-call feels like the keypad "took long" to register. None of
@@ -561,28 +560,35 @@ void loop() {
   // ends (granted, denied, or timed out), not after waiting a full new interval.
   bool userInteracting = mfaSessionActive || pinEntryActive;
 
-  // 7. Periodic device heartbeat (every 30s)
+  // 7. Handle inbound remote unlock commands from the Laravel backend - can block for up
+  // to ~3s waiting on the client socket (see checkRemoteUnlockServer()), so it gets the
+  // same userInteracting guard as the HTTP polls below instead of running unconditionally.
+  if (!userInteracting) {
+    checkRemoteUnlockServer();
+  }
+
+  // 8. Periodic device heartbeat (every 30s)
   if (!userInteracting && millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatMs = millis();
     sendHeartbeat();
     esp_task_wdt_reset(); // re-feed in case the call above blocked for a while
   }
 
-  // 8. Periodic settings refresh (every 60s)
+  // 9. Periodic settings refresh (every 60s)
   if (!userInteracting && millis() - lastSettingsRefreshMs >= SETTINGS_REFRESH_INTERVAL_MS) {
     lastSettingsRefreshMs = millis();
     fetchServerSettings();
     esp_task_wdt_reset();
   }
 
-  // 8b. Periodic offline credential cache refresh (every 5 min, while online)
+  // 9b. Periodic offline credential cache refresh (every 5 min, while online)
   if (!userInteracting && millis() - lastOfflineSyncMs >= OFFLINE_SYNC_INTERVAL_MS) {
     lastOfflineSyncMs = millis();
     syncOfflineCache();
     esp_task_wdt_reset();
   }
 
-  // 8c. Periodic offline access-event queue flush (every 45s, while online) - backfills
+  // 9c. Periodic offline access-event queue flush (every 45s, while online) - backfills
   // any door unlocks that were granted from the local cache while the server was
   // unreachable, so they still show up in the dashboard once connectivity returns.
   if (!userInteracting && millis() - lastOfflineFlushMs >= OFFLINE_QUEUE_FLUSH_INTERVAL_MS) {
@@ -591,7 +597,7 @@ void loop() {
     esp_task_wdt_reset();
   }
 
-  // 9. Poll server for pending enrollment commands (every 3s) - by far the most frequent
+  // 10. Poll server for pending enrollment commands (every 3s) - by far the most frequent
   // background call, and so the dominant source of keypad lag before this guard.
   static unsigned long lastEnrollPollMs = 0;
   if (!userInteracting && millis() - lastEnrollPollMs >= 3000) {
