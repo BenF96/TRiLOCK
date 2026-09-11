@@ -325,8 +325,11 @@ class HardwareApiController extends Controller
      */
     public function updateDoorStatus(Request $request)
     {
+        // Was 'in:opened,closed' only - silently 422'd both 'locked' (solenoid
+        // re-engaging, see ESP32 lockDoor()) and 'left_open' (ajar alarm, see
+        // checkDoorAjar()) despite this endpoint's own docblock promising all five.
         $validated = $request->validate([
-            'status'    => 'required|string|in:opened,closed',
+            'status'    => 'required|string|in:opened,closed,locked,left_open',
             'remarks'   => 'nullable|string',
             'device_id' => 'nullable|integer',
         ]);
@@ -341,6 +344,7 @@ class HardwareApiController extends Controller
             'status'    => $validated['status'],
             'opened_at' => $validated['status'] === 'opened' ? now() : null,
             'closed_at' => $validated['status'] === 'closed' ? now() : null,
+            'locked_at' => $validated['status'] === 'locked' ? now() : null,
             'remarks'   => $validated['remarks'] ?? "ESP32 door status event: {$validated['status']}",
         ]);
 

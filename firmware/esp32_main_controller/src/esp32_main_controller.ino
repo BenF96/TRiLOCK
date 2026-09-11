@@ -638,7 +638,12 @@ void lockDoor() {
 
   buzzerPlay(SND_LOCK, NOTE_COUNT(SND_LOCK), 0, BZ_PRIO_EVENT);
   Serial.println("DOOR LOCKED");
-  // Door hardware sensor will report 'closed' via checkDoorSensor() independently
+
+  // Report the real relock so the dashboard's door status doesn't stay stuck on
+  // "unlocked" until the next access attempt - this used to be silent, so a device
+  // with no physical door sensor (HAS_DOOR_SENSOR=0, the common case) never told the
+  // server the solenoid had re-engaged.
+  sendDoorStatusUpdate("locked", "Door auto-relocked after unlock timer expired");
 }
 
 void denyAccess() {
@@ -1600,8 +1605,11 @@ void fetchServerSettings() {
 }
 
 void sendDoorStatusUpdate(String status, String remarks) {
-  // Only 'opened' and 'closed' are valid door hardware sensor states
-  if (status != "opened" && status != "closed") return;
+  // 'opened'/'closed' come from the physical door contact sensor (checkDoorSensor()),
+  // 'left_open' from the ajar alarm (checkDoorAjar()), 'locked' from the solenoid
+  // re-engaging (lockDoor()). Was previously hardcoded to only 'opened'/'closed', which
+  // silently dropped every "left_open" alarm call below - it never reached the server.
+  if (status != "opened" && status != "closed" && status != "left_open" && status != "locked") return;
 
   if (WiFi.status() != WL_CONNECTED) return;
 
