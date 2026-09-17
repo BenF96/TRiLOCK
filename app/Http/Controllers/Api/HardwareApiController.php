@@ -160,6 +160,11 @@ class HardwareApiController extends Controller
             $this->touchDevice($deviceId, $request->ip());
         }
 
+        // Current LAN IP of the ESP32-CAM (from its own heartbeat), handed back to the main
+        // controller so it can trigger a capture with a direct Wi-Fi call instead of relying
+        // on a physical UART wire between the two boards.
+        $cameraIp = Device::where('device_type', 'esp32_cam')->value('ip_address');
+
         $log = AccessLog::create([
             'user_id'               => $user ? $user->id : null,
             'authentication_method' => $authorized ? $authMethod : 'unauthorized',
@@ -195,6 +200,7 @@ class HardwareApiController extends Controller
                 ],
                 'unlock_duration' => $settings->door_unlock_duration,
                 'access_log_id'  => $log->id,
+                'camera_ip'      => $cameraIp,
             ]);
         }
 
@@ -225,6 +231,7 @@ class HardwareApiController extends Controller
                 'message'         => "Security Lockout: Too many invalid attempts. Device locked for {$lockoutSec} seconds.",
                 'lockout_seconds' => $lockoutSec,
                 'access_log_id'   => $log->id,
+                'camera_ip'       => $cameraIp,
             ], 429);
         }
 
@@ -241,6 +248,7 @@ class HardwareApiController extends Controller
             'message'       => "Access Denied: Invalid or inactive credential (Attempt {$currentFails}/{$maxFails})",
             'access_log_id' => $log->id,
             'attempts_left' => max(0, $maxFails - $currentFails),
+            'camera_ip'     => $cameraIp,
         ], 403);
     }
 

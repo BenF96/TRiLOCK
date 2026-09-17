@@ -7,15 +7,25 @@
  * Authentication. Framework: Arduino / ESP32 Core
  * =====================================================================================
  *
- * SERIAL TRIGGER PROTOCOL
- *   The ESP32 Main Controller sends a single line over the shared UART
- * connection: "CAPTURE:<access_log_id>\n"   — capture and link photo to the
- * given access log entry "CAPTURE:0\n" or "CAPTURE\n" — capture without linking
- * (standalone security shot)
+ * CAPTURE TRIGGER PROTOCOLS (either can fire a capture; both share the same
+ * captureAndUploadImage() call)
  *
- *   The <access_log_id> is returned by the Laravel /api/access endpoint in the
- *   "access_log_id" field and is forwarded verbatim so photos are correctly
- * associated with the access event that triggered them.
+ *   1. Wi-Fi (primary): the ESP32 Main Controller POSTs directly to this
+ *      device's local IP on port 80: "POST /capture" with a JSON body
+ *      {"access_log_id": <id>}. No wiring between the two boards required -
+ *      both just need to be on the same Wi-Fi network. The main controller
+ *      learns this camera's current IP from the "camera_ip" field returned by
+ *      the Laravel /api/access endpoint (populated from this device's own
+ *      heartbeat).
+ *
+ *   2. Serial (legacy fallback): if the two boards are also wired together
+ *      over UART, the main controller sends a single line: "CAPTURE:<id>\n"
+ *      (or "CAPTURE:0\n" / "CAPTURE\n" for a standalone shot with no access
+ *      log to link).
+ *
+ *   In both cases the <access_log_id> is forwarded verbatim from Laravel's
+ *   "access_log_id" field so photos are correctly associated with the access
+ *   event that triggered them.
  * =====================================================================================
  */
 
@@ -25,6 +35,9 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WiFiServer.h>
+
+#define CAPTURE_SERVER_PORT 80
 
 // -------------------------------------------------------------------------------------
 // CAMERA PIN DEFINITIONS (AI-Thinker ESP32-CAM)
@@ -74,6 +87,8 @@ const unsigned long WIFI_RETRY_INTERVAL =
     10000; // Retry Wi-Fi every 10 seconds if dropped
 
 unsigned long lastHeartbeatMs = 0;
+
+WiFiServer captureServer(CAPTURE_SERVER_PORT);
 
 // -------------------------------------------------------------------------------------
 // SETUP FUNCTION
@@ -147,6 +162,11 @@ void setup() {
   // Connect to Wi-Fi
   connectWiFi();
 
+  // Start listening for direct Wi-Fi capture triggers from the ESP32 Main
+  // Controller (see CAPTURE TRIGGER PROTOCOLS above)
+  captureServer.begin();
+  Serial.printf("Capture server listening on port %d\n", CAPTURE_SERVER_PORT);
+
   // Send initial heartbeat so the dashboard marks this camera online
   // immediately
   sendHeartbeat();
@@ -172,8 +192,12 @@ void loop() {
     sendHeartbeat();
   }
 
+  // Listen for direct Wi-Fi capture triggers (primary trigger path)
+  checkCaptureServer();
+
   // Listen for trigger commands sent by the ESP32 Main Controller over serial.
-  // Expected format: "CAPTURE:<access_log_id>\n"
+  // Expected format: "CAPTURE:<access_log_id>\n" (legacy fallback, only used
+  // when the two boards are also wired together over UART)
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
@@ -196,6 +220,76 @@ void loop() {
   }
 
   delay(30); // Yield; Serial polling does not need to be tight
+}
+
+// -------------------------------------------------------------------------------------
+// WI-FI CAPTURE SERVER
+// Accepts "POST /capture" with a JSON body {"access_log_id": <id>} sent
+// directly from the ESP32 Main Controller over the local Wi-Fi network -
+// replaces the old UART-wire trigger so the two boards don't need to be
+// physically wired together.
+// -------------------------------------------------------------------------------------
+void checkCaptureServer() {
+  WiFiClient client = captureServer.available();
+  if (!client) return;
+
+  unsigned long clientTimeout = millis() + 3000;
+  while (!client.available() && millis() < clientTimeout) delay(1);
+
+  if (!client.available()) {
+    client.stop();
+    return;
+  }
+
+  String requestLine = client.readStringUntil('\n');
+  requestLine.trim();
+
+  String headerLine;
+  int contentLength = 0;
+  while (client.available()) {
+    headerLine = client.readStringUntil('\n');
+    headerLine.trim();
+    if (headerLine.startsWith("Content-Length:")) {
+      contentLength = headerLine.substring(16).toInt();
+    }
+    if (headerLine.length() == 0) break; // blank line = end of headers
+  }
+
+  String body = "";
+  unsigned long bodyTimeout = millis() + 1000;
+  while ((int)body.length() < contentLength && millis() < bodyTimeout) {
+    if (client.available()) body += (char)client.read();
+  }
+
+  bool isCaptureRequest = requestLine.startsWith("POST /capture");
+  String httpResponse;
+
+  if (isCaptureRequest) {
+    int accessLogId = 0;
+    int idPos = body.indexOf("\"access_log_id\"");
+    if (idPos != -1) {
+      int colonPos = body.indexOf(':', idPos);
+      if (colonPos != -1) {
+        accessLogId = body.substring(colonPos + 1).toInt();
+      }
+    }
+
+    Serial.printf("Wi-Fi capture triggered — access_log_id: %d\n", accessLogId);
+    httpResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                   "{\"status\":\"capturing\"}";
+    client.print(httpResponse);
+    delay(10);
+    client.stop();
+
+    captureAndUploadImage(accessLogId);
+    return;
+  }
+
+  httpResponse = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                 "{\"status\":\"error\",\"message\":\"Unknown command\"}";
+  client.print(httpResponse);
+  delay(10);
+  client.stop();
 }
 
 // -------------------------------------------------------------------------------------

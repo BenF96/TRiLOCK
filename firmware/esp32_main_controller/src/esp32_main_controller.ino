@@ -74,6 +74,7 @@ void printMfaStatus();
 void checkDoorSensor();
 void checkDoorAjar();
 void checkRemoteUnlockServer();
+void triggerCameraCapture(String cameraIp, int accessLogId);
 void pollEnrollmentCommand();
 void enrollPinOnKeypad(String sessionToken);
 void enrollFingerprintOnSensor(String sessionToken);
@@ -115,6 +116,11 @@ const int DEVICE_ID       = 4; // Device ID in TRILOCK database
 // within this window, fall back to the offline credential cache instead of leaving them
 // standing there for the full HTTP_TIMEOUT_MS.
 #define ACCESS_HTTP_TIMEOUT_MS     4000
+
+// Direct LAN call to the ESP32-CAM's own local IP (not the cloud server) to trigger a
+// capture - both boards are on the same Wi-Fi network so this should be near-instant;
+// a short timeout keeps a camera that's offline/rebooting from stalling the unlock flow.
+#define CAMERA_CAPTURE_HTTP_TIMEOUT_MS 2000
 
 // Heartbeat / settings-refresh / offline-sync / enrollment-poll all run periodically from
 // the main loop, which is otherwise busy scanning RFID/fingerprint/keypad. A short timeout
@@ -1231,6 +1237,30 @@ void checkRemoteUnlockServer() {
 }
 
 // -------------------------------------------------------------------------------------
+// CAMERA CAPTURE TRIGGER
+// Direct Wi-Fi call to the ESP32-CAM's own local IP (learned from the "camera_ip" field
+// of the /api/access response, itself sourced from the camera's own heartbeat) - replaces
+// the old UART-wire trigger so the two boards don't need to be physically wired together.
+// -------------------------------------------------------------------------------------
+void triggerCameraCapture(String cameraIp, int accessLogId) {
+  if (cameraIp.length() == 0) {
+    Serial.println("Camera capture skipped: camera IP unknown (camera offline?)");
+    return;
+  }
+
+  HTTPClient http;
+  String url = "http://" + cameraIp + "/capture";
+  http.begin(url);
+  http.setTimeout(CAMERA_CAPTURE_HTTP_TIMEOUT_MS);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{\"access_log_id\":" + String(accessLogId) + "}";
+  int httpCode = http.POST(payload);
+  Serial.printf("Camera capture trigger -> %s : HTTP %d\n", url.c_str(), httpCode);
+  http.end();
+}
+
+// -------------------------------------------------------------------------------------
 // REST API COMMUNICATIONS
 // -------------------------------------------------------------------------------------
 void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode) {
@@ -1269,6 +1299,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     deserializeJson(responseDoc, response);
 
     const char* status = responseDoc["status"];
+    String cameraIp = responseDoc["camera_ip"] | "";
     if (String(status) == "granted") {
       int unlockSecs = responseDoc["unlock_duration"] | 5;
       int accessLogId = responseDoc["access_log_id"] | 0;
@@ -1278,11 +1309,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
       // photographing successful/granted entries, which some sites disable for privacy
       // while still always capturing denied/security attempts below).
       if (cameraEnabled && captureEntryEnabled) {
-        if (accessLogId > 0) {
-          Serial.printf("CAPTURE:%d\n", accessLogId);
-        } else {
-          Serial.println("CAPTURE:0");
-        }
+        triggerCameraCapture(cameraIp, accessLogId);
         Serial.println(">>> CAMERA CAPTURE TRIGGERED (BEFORE DOOR UNLOCK) <<<");
 
         // Brief delay to allow camera capture of the person before solenoid opens
@@ -1296,7 +1323,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
       // Denied/security captures only respect the master switch - not "Record Entry
       // Captures", which only concerns successful entries.
       if (cameraEnabled && accessLogId > 0) {
-        Serial.printf("CAPTURE:%d\n", accessLogId);
+        triggerCameraCapture(cameraIp, accessLogId);
       }
       denyAccess();
     }
