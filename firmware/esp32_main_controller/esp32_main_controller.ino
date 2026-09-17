@@ -199,6 +199,17 @@ String        currentMfaPin         = "";
 unsigned long mfaSessionStartMs     = 0;
 bool          mfaSessionActive      = false;
 
+// Freshly-enrolled fingerprint slot, exempted from purgeRevokedFingerprints()'s orphan
+// sweep for a grace window (see enrollFingerprintOnSensor()/purgeRevokedFingerprints()).
+// The physical template is stored on-sensor the moment enrollment finishes, but the DB
+// row (and so /api/offline-sync's active_fingerprint_ids) isn't written until the admin
+// completes every remaining step of the enrollment wizard and commits - which can easily
+// take longer than the 5-minute periodic sync, otherwise wiping the slot before it's
+// ever recorded as active.
+#define FINGERPRINT_ENROLL_GRACE_MS 900000 // 15 minutes to finish the rest of the wizard
+int           pendingEnrollFingerId = 0;
+unsigned long pendingEnrollFingerMs = 0;
+
 // Short LED blink to confirm each keypress (non-blocking)
 #define KEY_BLINK_MS 80
 unsigned long keyBlinkStart = 0;
@@ -256,6 +267,12 @@ bool lastDoorState = HIGH;  // HIGH = Door Closed, LOW = Door Opened
 unsigned long lockTimer = 0;
 bool isDoorUnlocked = false;
 
+// Settings toggles fetched from GET /api/settings (see fetchServerSettings()) - default
+// to their DB defaults so behavior is unchanged until the first successful fetch.
+bool autoLockEnabled     = true; // "Auto-Relock Mechanism": re-engage solenoid when the unlock timer expires
+bool cameraEnabled       = true; // "ESP32-CAM Snapshot": master switch for triggering any capture at all
+bool captureEntryEnabled = true; // "Record Entry Captures": also capture on successful/granted entries
+
 // Door sensor debounce / ajar tracking
 bool rawDoorState = HIGH;
 unsigned long doorChangeTimer = 0;
@@ -305,10 +322,11 @@ static const BuzzerNote SND_WIFI_FAIL[] = {{700, 160}, {0, 90}, {500, 260}};
 static const BuzzerNote SND_SCAN[]      = {{2400, 45}};
 static const BuzzerNote SND_GRANTED[]   = {{2000, 130}, {0, 50}, {2600, 190}};
 static const BuzzerNote SND_DENIED[]    = {{500, 200}, {0, 90}, {400, 340}};
-static const BuzzerNote SND_LOCK[]      = {{1400, 130}};
 static const BuzzerNote SND_ERROR[]     = {{800, 80}, {0, 60}, {800, 80}, {0, 60}, {800, 80}};
 static const BuzzerNote SND_AJAR[]      = {{2800, 280}, {0, 320}}; // repeated until door closes
 static const BuzzerNote SND_REMOTE[]    = {{1800, 80}, {0, 40}, {2200, 80}, {0, 40}, {2600, 120}};
+static const BuzzerNote SND_DOOR_UNLOCK[] = {{2000, 1000}}; // single continuous 1s tone on unlock
+static const BuzzerNote SND_DOOR_LOCK[]   = {{1400, 1000}}; // single continuous 1s tone on lock
 
 // Sequencer state
 static const BuzzerNote* bzSeq = nullptr;
@@ -527,8 +545,11 @@ void loop() {
   buzzerUpdate();
   updateStatusLeds();
 
-  // 1. Check Solenoid Lock Timer
-  if (isDoorUnlocked && (millis() - lockTimer >= (unsigned long)(doorUnlockDuration * 1000))) {
+  // 1. Check Solenoid Lock Timer - gated by "Auto-Relock Mechanism". When disabled, the
+  // solenoid stays energized past the timer until an explicit remote lock command arrives
+  // (see the "lock" pending_command branch in sendHeartbeat()), so isDoorUnlocked/lockTimer
+  // are deliberately left untouched rather than silently clearing the unlocked state.
+  if (autoLockEnabled && isDoorUnlocked && (millis() - lockTimer >= (unsigned long)(doorUnlockDuration * 1000))) {
     lockDoor();
   }
 
@@ -624,8 +645,8 @@ void unlockDoor(int durationSeconds) {
   // Also reset keyBlink in case it was set before unlock
   keyBlinkActive = false;
 
-  // Beep Success
-  buzzerPlay(SND_GRANTED, NOTE_COUNT(SND_GRANTED), 0, BZ_PRIO_EVENT);
+  // Beep Success - single continuous 2s tone on unlock
+  buzzerPlay(SND_DOOR_UNLOCK, NOTE_COUNT(SND_DOOR_UNLOCK), 0, BZ_PRIO_EVENT);
 
   Serial.println("DOOR UNLOCKED");
 }
@@ -636,7 +657,8 @@ void lockDoor() {
   digitalWrite(LED_GREEN, LOW);
   digitalWrite(LED_RED, LOW);
 
-  buzzerPlay(SND_LOCK, NOTE_COUNT(SND_LOCK), 0, BZ_PRIO_EVENT);
+  // Single continuous 2s tone on lock
+  buzzerPlay(SND_DOOR_LOCK, NOTE_COUNT(SND_DOOR_LOCK), 0, BZ_PRIO_EVENT);
   Serial.println("DOOR LOCKED");
 
   // Report the real relock so the dashboard's door status doesn't stay stuck on
@@ -785,11 +807,20 @@ void checkFingerprint() {
     keyBlinkActive = true;
     buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
 
-    Serial.printf("[Factor 2/3] Fingerprint Matched: ID #%d\n", fingerId);
+    Serial.printf("[Factor 2/3] Fingerprint Matched: ID #%d (confidence %d)\n", fingerId, finger.confidence);
     printMfaStatus();
     checkMfaCompletion();
   } else {
-    Serial.println("Fingerprint scan failed or unassigned.");
+    // "Failed" and "unassigned" used to be reported identically, which made a genuine
+    // sensor/communication fault indistinguishable from a plain no-match. FINGERPRINT_
+    // NOTFOUND means the sensor read the finger fine but found no library template close
+    // enough to it (bad placement, wrong finger, or a template that's no longer on the
+    // sensor) - anything else means the search itself errored (wiring/comms/power fault).
+    if (p == FINGERPRINT_NOTFOUND) {
+      Serial.println("Fingerprint scan: no matching template found (bad placement, wrong finger, or template missing from sensor).");
+    } else {
+      Serial.printf("Fingerprint scan: sensor search error (code 0x%02X) - check wiring/power, not a credential mismatch.\n", p);
+    }
     buzzerPlayNow(SND_DENIED, NOTE_COUNT(SND_DENIED));
   }
 }
@@ -1013,6 +1044,10 @@ void enrollFingerprintOnSensor(String sessionToken) {
   if (p == FINGERPRINT_OK) {
     Serial.printf("Fingerprint stored successfully in slot #%d!\n", id);
     buzzerPlayNow(SND_GRANTED, NOTE_COUNT(SND_GRANTED));
+    // Exempt this slot from the orphan-sensor-scan purge until the DB commit (end of the
+    // enrollment wizard) has had a chance to make it show up as active - see declaration.
+    pendingEnrollFingerId = id;
+    pendingEnrollFingerMs = millis();
     sendEnrollmentResult("fingerprint", sessionToken, "success", "", id);
   } else {
     sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Failed to store fingerprint model.");
@@ -1238,22 +1273,29 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
       int unlockSecs = responseDoc["unlock_duration"] | 5;
       int accessLogId = responseDoc["access_log_id"] | 0;
 
-      // 1. Trigger ESP32-CAM to capture photo BEFORE unlocking the door
-      if (accessLogId > 0) {
-        Serial.printf("CAPTURE:%d\n", accessLogId);
-      } else {
-        Serial.println("CAPTURE:0");
-      }
-      Serial.println(">>> CAMERA CAPTURE TRIGGERED (BEFORE DOOR UNLOCK) <<<");
+      // 1. Trigger ESP32-CAM to capture photo BEFORE unlocking the door - gated by both
+      // "ESP32-CAM Snapshot" (master switch) and "Record Entry Captures" (specifically
+      // photographing successful/granted entries, which some sites disable for privacy
+      // while still always capturing denied/security attempts below).
+      if (cameraEnabled && captureEntryEnabled) {
+        if (accessLogId > 0) {
+          Serial.printf("CAPTURE:%d\n", accessLogId);
+        } else {
+          Serial.println("CAPTURE:0");
+        }
+        Serial.println(">>> CAMERA CAPTURE TRIGGERED (BEFORE DOOR UNLOCK) <<<");
 
-      // Brief delay to allow camera capture of the person before solenoid opens
-      delay(400);
+        // Brief delay to allow camera capture of the person before solenoid opens
+        delay(400);
+      }
 
       // 2. Unlock Solenoid Door
       unlockDoor(unlockSecs);
     } else {
       int accessLogId = responseDoc["access_log_id"] | 0;
-      if (accessLogId > 0) {
+      // Denied/security captures only respect the master switch - not "Record Entry
+      // Captures", which only concerns successful entries.
+      if (cameraEnabled && accessLogId > 0) {
         Serial.printf("CAPTURE:%d\n", accessLogId);
       }
       denyAccess();
@@ -1374,6 +1416,15 @@ std::vector<int> readCachedFingerprintIds(const char* path) {
 // A user (or just their fingerprint credential) deleted from the dashboard drops out of
 // GET /api/offline-sync on the next resync. Purges revoked models from the AS608 sensor.
 void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<int>& activeServerIds) {
+  // Once a pending enrollment's slot shows up as active, its grace exemption is no
+  // longer needed - clear it so a genuine future revocation of that same slot isn't
+  // permanently protected.
+  if (pendingEnrollFingerId > 0) {
+    for (int n : activeServerIds) {
+      if (n == pendingEnrollFingerId) { pendingEnrollFingerId = 0; break; }
+    }
+  }
+
   // 1. Check all previously cached IDs against the active server list
   for (int id : oldIds) {
     bool stillActive = false;
@@ -1391,7 +1442,12 @@ void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<
     for (int n : activeServerIds) {
       if (n == slot) { isActive = true; break; }
     }
-    if (!isActive) {
+    // Skip a just-enrolled slot still inside its grace window - the DB commit for it
+    // (end of the multi-step enrollment wizard) may not have landed yet, and this sweep
+    // can't otherwise tell "never-synced-yet" apart from "genuinely revoked."
+    bool inEnrollGrace = (slot == pendingEnrollFingerId) &&
+                         (millis() - pendingEnrollFingerMs < FINGERPRINT_ENROLL_GRACE_MS);
+    if (!isActive && !inEnrollGrace) {
       if (finger.loadModel(slot) == FINGERPRINT_OK) {
         Serial.printf("Found orphan/deleted fingerprint slot #%d on sensor - purging...\n", slot);
         deleteFingerprintFromSensor(slot);
@@ -1598,6 +1654,14 @@ void fetchServerSettings() {
     buzzerSetMuted(!buzzerEnabled);
     Serial.print("Buzzer: ");
     Serial.println(buzzerEnabled ? "ENABLED" : "MUTED");
+
+    autoLockEnabled     = doc["data"]["auto_lock"] | true;
+    cameraEnabled       = doc["data"]["camera_enabled"] | true;
+    captureEntryEnabled = doc["data"]["capture_entry"] | true;
+    Serial.printf("Auto-lock: %s | Camera: %s | Capture entries: %s\n",
+      autoLockEnabled ? "ON" : "OFF",
+      cameraEnabled ? "ON" : "OFF",
+      captureEntryEnabled ? "ON" : "OFF");
   } else {
     Serial.printf("Settings fetch failed (HTTP %d), keeping previous values.\n", httpResponseCode);
   }

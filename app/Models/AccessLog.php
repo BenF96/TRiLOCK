@@ -37,6 +37,14 @@ class AccessLog extends Model
      */
     public function getCapturedImageUrlAttribute(): ?string
     {
-        return $this->captured_image ? \Illuminate\Support\Facades\Storage::url($this->captured_image) : null;
+        if (!$this->captured_image) {
+            return null;
+        }
+
+        if (str_starts_with($this->captured_image, 'http://') || str_starts_with($this->captured_image, 'https://')) {
+            return $this->captured_image;
+        }
+
+        return \Illuminate\Support\Facades\Storage::url($this->captured_image);
     }
 }

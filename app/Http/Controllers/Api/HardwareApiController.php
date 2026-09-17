@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use App\Services\SupabaseStorageService;
 
 class HardwareApiController extends Controller
 {
@@ -296,26 +297,58 @@ class HardwareApiController extends Controller
      * POST /api/upload-image
      * ESP32-CAM uploads captured image JPG file
      */
-    public function uploadImage(Request $request)
+    public function uploadImage(Request $request, SupabaseStorageService $supabaseStorage)
     {
         $request->validate([
             'image'         => 'required|image|mimes:jpeg,jpg,png|max:5120',
-            'access_log_id' => 'nullable|exists:access_logs,id',
+            'access_log_id' => 'nullable|integer',
+            'device_id'     => 'nullable|integer',
         ]);
 
-        $path = $request->file('image')->store('captures');
+        $imageFile = $request->file('image');
+        $path = $supabaseStorage->upload($imageFile);
 
-        if ($request->filled('access_log_id')) {
-            $log = AccessLog::find($request->access_log_id);
+        // Prefer the device_id the ESP32-CAM sent explicitly (same pattern as every other
+        // hardware endpoint); fall back to a per-device token match if the CAM didn't send one.
+        $deviceId = $request->input('device_id');
+        if (!$deviceId) {
+            $device = $request->attributes->get('authenticated_device');
+            $deviceId = $device ? $device->id : null;
+        }
+        if ($deviceId) {
+            $this->touchDevice($deviceId, $request->ip());
+        }
+
+        $logId = $request->input('access_log_id');
+        $log = null;
+
+        if (!empty($logId)) {
+            $log = AccessLog::find($logId);
             if ($log) {
                 $log->update(['captured_image' => $path]);
             }
         }
 
+        // If no access log was linked (or access_log_id was 0/unmatched), create a standalone capture log
+        // so the photo immediately appears in Camera Monitoring (/camera), Access Logs (/logs), and Dashboard
+        if (!$log) {
+            $log = AccessLog::create([
+                'user_id'               => null,
+                'authentication_method' => 'unauthorized',
+                'access_type'           => 'denied',
+                'captured_image'        => $path,
+                'door_status'           => 'locked',
+                'date'                  => now()->toDateString(),
+                'time'                  => now()->toTimeString(),
+                'device_id'             => $deviceId,
+            ]);
+        }
+
         return response()->json([
-            'status'     => 'success',
-            'message'    => 'Image uploaded successfully',
-            'image_path' => $path,
+            'status'        => 'success',
+            'message'       => 'Image uploaded successfully',
+            'image_path'    => $path,
+            'access_log_id' => $log->id,
         ]);
     }
 

@@ -2,109 +2,128 @@
  * =====================================================================================
  * TRILOCK System - Production-Hardened ESP32-CAM Security Camera Firmware
  * Hardware: AI-Thinker ESP32-CAM Module (OV2640 Camera Sensor)
- * Function: Captures JPG photo on security access trigger and uploads multipart/form-data
- *           to TRILOCK REST API (/api/upload-image) with Device Token Authentication.
- * Framework: Arduino / ESP32 Core
+ * Function: Captures JPG photo on security access trigger and uploads
+ * multipart/form-data to TRILOCK REST API (/api/upload-image) with Device Token
+ * Authentication. Framework: Arduino / ESP32 Core
  * =====================================================================================
  *
  * SERIAL TRIGGER PROTOCOL
- *   The ESP32 Main Controller sends a single line over the shared UART connection:
- *     "CAPTURE:<access_log_id>\n"   — capture and link photo to the given access log entry
- *     "CAPTURE:0\n" or "CAPTURE\n" — capture without linking (standalone security shot)
+ *   The ESP32 Main Controller sends a single line over the shared UART
+ * connection: "CAPTURE:<access_log_id>\n"   — capture and link photo to the
+ * given access log entry "CAPTURE:0\n" or "CAPTURE\n" — capture without linking
+ * (standalone security shot)
  *
  *   The <access_log_id> is returned by the Laravel /api/access endpoint in the
- *   "access_log_id" field and is forwarded verbatim so photos are correctly associated
- *   with the access event that triggered them.
+ *   "access_log_id" field and is forwarded verbatim so photos are correctly
+ * associated with the access event that triggered them.
  * =====================================================================================
  */
 
 #include "esp_camera.h"
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include "soc/soc.h"
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
 
 // -------------------------------------------------------------------------------------
 // CAMERA PIN DEFINITIONS (AI-Thinker ESP32-CAM)
 // -------------------------------------------------------------------------------------
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
 
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
 
-#define FLASH_LED_PIN      4 // High intensity onboard LED
+#define FLASH_LED_PIN 4 // High intensity onboard LED
 
 // -------------------------------------------------------------------------------------
 // CONFIGURATION & CREDENTIALS
 // -------------------------------------------------------------------------------------
-const char* WIFI_SSID      = "Redmi Note 11";
-const char* WIFI_PASSWORD  = "benben96";
-const char* SERVER_URL     = "https://trilock-lx5t.onrender.com/api/upload-image";
-const char* DEVICE_API_KEY = "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
+const char *WIFI_SSID = "Redmi Note 11";
+const char *WIFI_PASSWORD = "benben96";
+const char *API_BASE_URL = "https://trilock-lx5t.onrender.com";
+const char *DEVICE_API_KEY =
+    "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
 
-#define HTTP_TIMEOUT_MS   10000 // Max upload wait time (large JPEG over WiFi)
+// Row id of this camera in the `devices` table (Dashboard -> Devices ->
+// "Security Camera ESP32-CAM"). Sent with every heartbeat/upload so the
+// dashboard can show this specific unit online/offline - set to 0 to disable
+// heartbeat/device attribution entirely.
+const int DEVICE_ID = 9;
+
+#define HTTP_TIMEOUT_MS                                                        \
+  30000 // 30s timeout for cloud storage uploads / cold starts
+#define HEARTBEAT_INTERVAL_MS                                                  \
+  30000 // 30s device keep-alive ping, matches main controller
 
 unsigned long lastWifiRetryMs = 0;
-const unsigned long WIFI_RETRY_INTERVAL = 10000; // Retry Wi-Fi every 10 seconds if dropped
+const unsigned long WIFI_RETRY_INTERVAL =
+    10000; // Retry Wi-Fi every 10 seconds if dropped
+
+unsigned long lastHeartbeatMs = 0;
 
 // -------------------------------------------------------------------------------------
 // SETUP FUNCTION
 // -------------------------------------------------------------------------------------
 void setup() {
-  // Disable brownout detector during boot to prevent power-dip reboots on flash trigger
+  // Disable brownout detector during boot to prevent power-dip reboots on flash
+  // trigger
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
-  Serial.setTimeout(20); // Fast timeout: avoid 1000ms Arduino default blocking on UART
+  Serial.setTimeout(
+      20); // Fast timeout: avoid 1000ms Arduino default blocking on UART
   pinMode(FLASH_LED_PIN, OUTPUT);
   digitalWrite(FLASH_LED_PIN, LOW); // Flash LED Off
 
   // Configure Camera Parameters
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0       = Y2_GPIO_NUM;
-  config.pin_d1       = Y3_GPIO_NUM;
-  config.pin_d2       = Y4_GPIO_NUM;
-  config.pin_d3       = Y5_GPIO_NUM;
-  config.pin_d4       = Y6_GPIO_NUM;
-  config.pin_d5       = Y7_GPIO_NUM;
-  config.pin_d6       = Y8_GPIO_NUM;
-  config.pin_d7       = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;
-  config.pin_pclk     = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM;
-  config.pin_href     = HREF_GPIO_NUM;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
   config.pin_sccb_sda = SIOD_GPIO_NUM;
   config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;
-  config.pin_reset    = RESET_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // Frame size & quality configuration optimized for rapid capture and fast loading
+  // Frame size & quality configuration optimized for rapid capture and fast
+  // loading
   if (psramFound()) {
-    config.frame_size   = FRAMESIZE_VGA;  // 640x480 resolution
-    config.jpeg_quality = 12;             // Balanced high quality & fast compression
-    config.fb_count     = 2;              // Double buffering for zero frame drop
-    config.grab_mode    = CAMERA_GRAB_LATEST; // Always grab the most recent frame instantly
+    config.frame_size = FRAMESIZE_VGA; // 640x480 resolution
+    config.jpeg_quality = 12; // Balanced high quality & fast compression
+    config.fb_count = 2;      // Double buffering for zero frame drop
+    config.grab_mode =
+        CAMERA_GRAB_LATEST; // Always grab the most recent frame instantly
   } else {
-    config.frame_size   = FRAMESIZE_CIF;  // 400x296 resolution
+    config.frame_size = FRAMESIZE_CIF; // 400x296 resolution
     config.jpeg_quality = 14;
-    config.fb_count     = 1;
+    config.fb_count = 1;
   }
 
   // Initialize OV2640 Camera with retry
@@ -118,13 +137,19 @@ void setup() {
   }
 
   if (err != ESP_OK) {
-    Serial.printf("FATAL: Camera initialization failed permanently with error 0x%x\n", err);
+    Serial.printf(
+        "FATAL: Camera initialization failed permanently with error 0x%x\n",
+        err);
   } else {
     Serial.println("ESP32-CAM OV2640 Module initialized successfully!");
   }
 
   // Connect to Wi-Fi
   connectWiFi();
+
+  // Send initial heartbeat so the dashboard marks this camera online
+  // immediately
+  sendHeartbeat();
 }
 
 // -------------------------------------------------------------------------------------
@@ -138,6 +163,13 @@ void loop() {
       Serial.println("Wi-Fi connection lost. Attempting reconnect...");
       WiFi.reconnect();
     }
+  }
+
+  // Periodic device heartbeat (every 30s) so the Devices dashboard reflects
+  // this camera's real online/offline status instead of sitting stale forever.
+  if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatMs = millis();
+    sendHeartbeat();
   }
 
   // Listen for trigger commands sent by the ESP32 Main Controller over serial.
@@ -154,7 +186,8 @@ void loop() {
       if (colonPos != -1) {
         String idStr = cmd.substring(colonPos + 1);
         idStr.trim();
-        accessLogId = idStr.toInt(); // returns 0 on parse failure, which is safe
+        accessLogId =
+            idStr.toInt(); // returns 0 on parse failure, which is safe
       }
 
       Serial.printf("Capture triggered — access_log_id: %d\n", accessLogId);
@@ -180,7 +213,7 @@ bool captureAndUploadImage(int accessLogId) {
   digitalWrite(FLASH_LED_PIN, HIGH);
   delay(30);
 
-  camera_fb_t* fb = esp_camera_fb_get();
+  camera_fb_t *fb = esp_camera_fb_get();
   digitalWrite(FLASH_LED_PIN, LOW);
 
   if (!fb) {
@@ -191,8 +224,19 @@ bool captureAndUploadImage(int accessLogId) {
   Serial.printf("Captured JPEG Image Size: %u bytes\n", fb->len);
 
   // Upload Photo to Server via HTTP Multipart POST
+  String uploadUrl = String(API_BASE_URL) + "/api/upload-image";
   HTTPClient http;
-  http.begin(SERVER_URL);
+  WiFiClientSecure secureClient;
+  WiFiClient regularClient;
+
+  if (uploadUrl.startsWith("https://")) {
+    secureClient
+        .setInsecure(); // Bypass CA verification for Render/Cloudflare HTTPS
+    http.begin(secureClient, uploadUrl);
+  } else {
+    http.begin(regularClient, uploadUrl);
+  }
+
   http.setTimeout(HTTP_TIMEOUT_MS);
 
   // Add Production Authentication & Security Headers
@@ -204,21 +248,39 @@ bool captureAndUploadImage(int accessLogId) {
 
   // Construct Multipart Body
   String head = "--" + boundary + "\r\n";
-  head += "Content-Disposition: form-data; name=\"image\"; filename=\"capture.jpg\"\r\n";
+  head += "Content-Disposition: form-data; name=\"image\"; "
+          "filename=\"capture.jpg\"\r\n";
   head += "Content-Type: image/jpeg\r\n\r\n";
 
-  // Build tail: always close the image part, then optionally append the access_log_id field
+  // Build tail: always close the image part, then optionally append the
+  // access_log_id and device_id fields so the server can link the photo and
+  // mark this camera online.
   String tail = "\r\n--" + boundary;
   if (accessLogId > 0) {
-    tail += "\r\nContent-Disposition: form-data; name=\"access_log_id\"\r\n\r\n";
+    tail +=
+        "\r\nContent-Disposition: form-data; name=\"access_log_id\"\r\n\r\n";
     tail += String(accessLogId);
+    tail += "\r\n--" + boundary;
+  }
+  if (DEVICE_ID > 0) {
+    tail += "\r\nContent-Disposition: form-data; name=\"device_id\"\r\n\r\n";
+    tail += String(DEVICE_ID);
     tail += "\r\n--" + boundary;
   }
   tail += "--\r\n";
 
   size_t totalLen = head.length() + fb->len + tail.length();
 
-  uint8_t* buffer = (uint8_t*) malloc(totalLen);
+  // Allocate in 4MB external PSRAM if available to prevent internal heap
+  // exhaustion
+  uint8_t *buffer = nullptr;
+  if (psramFound()) {
+    buffer = (uint8_t *)ps_malloc(totalLen);
+  }
+  if (!buffer) {
+    buffer = (uint8_t *)malloc(totalLen);
+  }
+
   if (!buffer) {
     Serial.println("Memory allocation failed for upload buffer!");
     esp_camera_fb_return(fb);
@@ -242,10 +304,52 @@ bool captureAndUploadImage(int accessLogId) {
     http.end();
     return (httpCode == 200 || httpCode == 201);
   } else {
-    Serial.printf("HTTP POST Upload Failed: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("HTTP POST Upload Failed: %s\n",
+                  http.errorToString(httpCode).c_str());
     http.end();
     return false;
   }
+}
+
+// -------------------------------------------------------------------------------------
+// DEVICE HEARTBEAT
+// Keep-alive ping so the Devices dashboard shows this camera's real
+// online/offline status (mirrors the ESP32 Main Controller's sendHeartbeat()).
+// Silently skipped when DEVICE_ID hasn't been set (still 0) or Wi-Fi is down.
+// -------------------------------------------------------------------------------------
+void sendHeartbeat() {
+  if (DEVICE_ID <= 0 || WiFi.status() != WL_CONNECTED)
+    return;
+
+  String url = String(API_BASE_URL) + "/api/heartbeat";
+  HTTPClient http;
+  WiFiClientSecure secureClient;
+  WiFiClient regularClient;
+
+  if (url.startsWith("https://")) {
+    secureClient.setInsecure();
+    http.begin(secureClient, url);
+  } else {
+    http.begin(regularClient, url);
+  }
+
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.addHeader("X-Device-Token", DEVICE_API_KEY);
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{\"device_id\":" + String(DEVICE_ID) +
+                   ",\"ip_address\":\"" + WiFi.localIP().toString() + "\"}";
+
+  int httpCode = http.POST(payload);
+  if (httpCode > 0) {
+    Serial.printf("Heartbeat sent (device_id=%d) - HTTP %d\n", DEVICE_ID,
+                  httpCode);
+  } else {
+    Serial.printf("Heartbeat failed: %s\n",
+                  http.errorToString(httpCode).c_str());
+  }
+  http.end();
 }
 
 // -------------------------------------------------------------------------------------
@@ -255,7 +359,8 @@ void connectWiFi() {
   Serial.print("Connecting to Wi-Fi: ");
   Serial.println(WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false); // CRITICAL: Disable modem sleep for maximum throughput and low latency
+  WiFi.setSleep(false); // CRITICAL: Disable modem sleep for maximum throughput
+                        // and low latency
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int attempts = 0;

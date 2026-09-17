@@ -67,7 +67,15 @@ class User extends Authenticatable
      */
     public function getPhotoUrlAttribute(): ?string
     {
-        return $this->photo ? \Illuminate\Support\Facades\Storage::url($this->photo) : null;
+        if (!$this->photo) {
+            return null;
+        }
+
+        if (str_starts_with($this->photo, 'http://') || str_starts_with($this->photo, 'https://')) {
+            return $this->photo;
+        }
+
+        return \Illuminate\Support\Facades\Storage::url($this->photo);
     }
 
     public function rfidCards()
