@@ -43,7 +43,13 @@ class HardwareApiController extends Controller
 
     /**
      * POST /api/access
-     * ESP32 sends RFID uid or Fingerprint ID for authentication
+     * ESP32 sends RFID uid or Fingerprint ID for authentication.
+     *
+     * Every rejected attempt - including ones the ESP32 decides locally (auth_method
+     * "local_reject", e.g. a fingerprint with no matching template on the sensor) and
+     * ones arriving during an active lockout - is written to access_logs as 'denied'
+     * with a denial_reason, counts toward the brute-force lockout, and hands back an
+     * access_log_id + camera_ip so the ESP32-CAM can photograph the attempt.
      */
     public function processAccess(Request $request)
     {
@@ -54,6 +60,7 @@ class HardwareApiController extends Controller
             'fingerprint_id' => 'nullable|integer',
             'pin_code'       => 'nullable|string',
             'device_id'      => 'nullable|integer',
+            'denial_reason'  => 'nullable|string|in:' . implode(',', AccessLog::DEVICE_DENIAL_REASONS),
         ]);
 
         $deviceId   = $validated['device_id'] ?? null;
@@ -61,101 +68,7 @@ class HardwareApiController extends Controller
         $lockoutKey = "trilock_lockout_{$clientKey}";
         $failKey    = "trilock_failed_{$clientKey}";
 
-        // Check if currently locked out
-        $lockoutUntil = Cache::get($lockoutKey);
-        if ($lockoutUntil && now()->timestamp < $lockoutUntil) {
-            $remaining = $lockoutUntil - now()->timestamp;
-            return response()->json([
-                'status'          => 'locked_out',
-                'message'         => "Security Lockout: Too many invalid attempts. Try again in {$remaining} seconds.",
-                'lockout_seconds' => $remaining,
-            ], 429);
-        }
-
-        $settings   = Setting::getSettings();
-        $user       = null;
-        $authorized = false;
-        $authMethod = $validated['auth_method'];
-
-        // 1. Triple Multi-Factor Authentication: RFID + Fingerprint + PIN required
-        if ($authMethod === 'multi_factor' || $authMethod === 'triple_auth' || $authMethod === 'all_three' || $authMethod === 'rfid_fingerprint_pin') {
-            $cardUid = !empty($validated['card_uid']) ? strtoupper($validated['card_uid']) : null;
-            $fpId    = !empty($validated['fingerprint_id']) ? (int)$validated['fingerprint_id'] : null;
-            $pinCode = !empty($validated['pin_code']) ? $validated['pin_code'] : null;
-
-            if ($cardUid && $fpId && $pinCode) {
-                $rfid = RfidCard::where('card_uid', $cardUid)->where('status', 'active')->first();
-                $fp   = Fingerprint::where('fingerprint_id', $fpId)->where('status', 'active')->first();
-                
-                $pinUser = null;
-                $pins = AccessPin::where('status', 'active')->with('user')->get();
-                foreach ($pins as $pin) {
-                    if (Hash::check($pinCode, $pin->pin_code)) {
-                        $pinUser = $pin->user;
-                        break;
-                    }
-                }
-
-                // All 3 factors must match the same active user
-                if ($rfid && $fp && $pinUser &&
-                    $rfid->user_id === $fp->user_id &&
-                    $rfid->user_id === $pinUser->id &&
-                    $rfid->user && $rfid->user->status === 'active') {
-                    $user = $rfid->user;
-                    $authorized = true;
-                    $authMethod = 'multi_factor';
-                }
-            }
-        } elseif ($authMethod === 'rfid' && !empty($validated['card_uid'])) {
-            $rfid = RfidCard::where('card_uid', strtoupper($validated['card_uid']))
-                ->where('status', 'active')
-                ->first();
-            if ($rfid && $rfid->user) {
-                $user = $rfid->user;
-                if ($user->status === 'active') {
-                    $authorized = true;
-                }
-            }
-        } elseif ($authMethod === 'fingerprint' && !empty($validated['fingerprint_id'])) {
-            $fp = Fingerprint::where('fingerprint_id', $validated['fingerprint_id'])
-                ->where('status', 'active')
-                ->first();
-            if ($fp && $fp->user) {
-                $user = $fp->user;
-                if ($user->status === 'active') {
-                    $authorized = true;
-                }
-            }
-        } elseif ($authMethod === 'pin' && !empty($validated['pin_code'])) {
-            $pins = AccessPin::where('status', 'active')->with('user')->get();
-            foreach ($pins as $pin) {
-                if (Hash::check($validated['pin_code'], $pin->pin_code)) {
-                    if ($pin->user) {
-                        $user = $pin->user;
-                        if ($user->status === 'active') {
-                            $authorized = true;
-                        }
-                    }
-                    break;
-                }
-            }
-        } elseif ($authMethod === 'rfid_fingerprint') {
-            $rfid = RfidCard::where('card_uid', strtoupper($validated['card_uid']))
-                ->where('status', 'active')
-                ->first();
-            $fp = Fingerprint::where('fingerprint_id', $validated['fingerprint_id'])
-                ->where('status', 'active')
-                ->first();
-            if ($rfid && $fp && $rfid->user_id === $fp->user_id && $rfid->user) {
-                $user = $rfid->user;
-                if ($user->status === 'active') {
-                    $authorized = true;
-                }
-            }
-        }
-
         // Update device heartbeat whenever hardware checks in
-        $deviceId = $validated['device_id'] ?? null;
         if ($deviceId) {
             $this->touchDevice($deviceId, $request->ip());
         }
@@ -163,20 +76,116 @@ class HardwareApiController extends Controller
         // Current LAN IP of the ESP32-CAM (from its own heartbeat), handed back to the main
         // controller so it can trigger a capture with a direct Wi-Fi call instead of relying
         // on a physical UART wire between the two boards.
-        $cameraIp = Device::where('device_type', 'esp32_cam')->value('ip_address');
+        $cameraIp = Device::where('device_type', 'esp32_cam')
+            ->whereNotNull('ip_address')
+            ->orderByDesc('last_seen')
+            ->value('ip_address');
 
-        $log = AccessLog::create([
-            'user_id'               => $user ? $user->id : null,
-            'authentication_method' => $authorized ? $authMethod : 'unauthorized',
-            'access_type'           => $authorized ? 'entry' : 'denied',
-            'captured_image'        => null,
-            'door_status'           => $authorized ? 'unlocked' : 'locked',
-            'date'                  => now()->toDateString(),
-            'time'                  => now()->toTimeString(),
-            'device_id'             => $deviceId,
-        ]);
+        // Check if currently locked out. The attempt is still recorded (and photographed)
+        // - a burst of tries during a lockout is exactly what an admin needs to see.
+        $lockoutUntil = Cache::get($lockoutKey);
+        if ($lockoutUntil && now()->timestamp < $lockoutUntil) {
+            $remaining = $lockoutUntil - now()->timestamp;
+            $log = $this->logDeniedAttempt(null, 'lockout_active', $deviceId);
 
-        if ($authorized) {
+            return response()->json([
+                'status'          => 'locked_out',
+                'message'         => "Security Lockout: Too many invalid attempts. Try again in {$remaining} seconds.",
+                'reason'          => 'lockout_active',
+                'lockout_seconds' => $remaining,
+                'access_log_id'   => $log->id,
+                'camera_ip'       => $cameraIp,
+            ], 429);
+        }
+
+        $settings     = Setting::getSettings();
+        $user         = null;
+        $denialReason = null;
+        $authMethod   = $validated['auth_method'];
+        $cardUid      = !empty($validated['card_uid']) ? strtoupper($validated['card_uid']) : null;
+        $fpId         = !empty($validated['fingerprint_id']) ? (int) $validated['fingerprint_id'] : null;
+        $pinCode      = !empty($validated['pin_code']) ? $validated['pin_code'] : null;
+
+        // 1. Triple Multi-Factor Authentication: RFID + Fingerprint + PIN required
+        if (in_array($authMethod, ['multi_factor', 'triple_auth', 'all_three', 'rfid_fingerprint_pin'], true)) {
+            $authMethod = 'multi_factor';
+
+            if (!$cardUid || !$fpId || !$pinCode) {
+                $denialReason = 'missing_factors';
+            } else {
+                $rfid = RfidCard::with('user')->where('card_uid', $cardUid)->where('status', 'active')->first();
+                $fp   = Fingerprint::where('fingerprint_id', $fpId)->where('status', 'active')->first();
+
+                // Attribute the attempt to the card's owner (if any) so a stolen/borrowed
+                // card shows up against the right person in the audit trail.
+                $user = $rfid?->user;
+
+                if (!$user) {
+                    $denialReason = 'rfid_not_recognized';
+                } elseif (!$fp) {
+                    $denialReason = 'fingerprint_not_recognized';
+                } elseif ($fp->user_id !== $rfid->user_id) {
+                    $denialReason = 'credential_mismatch';
+                } elseif (!$this->pinMatchesUser($pinCode, $rfid->user_id)) {
+                    $denialReason = 'pin_incorrect';
+                } elseif ($user->status !== 'active') {
+                    $denialReason = 'user_inactive';
+                }
+            }
+        } elseif ($authMethod === 'local_reject') {
+            // The ESP32 already rejected this on-device (nothing it could send us to verify)
+            // - record it, count it toward the lockout, and let the camera capture it.
+            $denialReason = $validated['denial_reason'] ?? 'fingerprint_not_recognized';
+            if ($cardUid) {
+                $user = RfidCard::with('user')->where('card_uid', $cardUid)->where('status', 'active')->first()?->user;
+            }
+        } elseif ($authMethod === 'rfid') {
+            $rfid = $cardUid ? RfidCard::with('user')->where('card_uid', $cardUid)->where('status', 'active')->first() : null;
+            $user = $rfid?->user;
+            $denialReason = !$user ? 'rfid_not_recognized' : ($user->status !== 'active' ? 'user_inactive' : null);
+        } elseif ($authMethod === 'fingerprint') {
+            $fp = $fpId ? Fingerprint::with('user')->where('fingerprint_id', $fpId)->where('status', 'active')->first() : null;
+            $user = $fp?->user;
+            $denialReason = !$user ? 'fingerprint_not_recognized' : ($user->status !== 'active' ? 'user_inactive' : null);
+        } elseif ($authMethod === 'pin') {
+            if ($pinCode) {
+                foreach (AccessPin::where('status', 'active')->with('user')->get() as $pin) {
+                    if (Hash::check($pinCode, $pin->pin_code)) {
+                        $user = $pin->user;
+                        break;
+                    }
+                }
+            }
+            $denialReason = !$user ? 'pin_incorrect' : ($user->status !== 'active' ? 'user_inactive' : null);
+        } elseif ($authMethod === 'rfid_fingerprint') {
+            $rfid = $cardUid ? RfidCard::with('user')->where('card_uid', $cardUid)->where('status', 'active')->first() : null;
+            $fp   = $fpId ? Fingerprint::where('fingerprint_id', $fpId)->where('status', 'active')->first() : null;
+            $user = $rfid?->user;
+            if (!$user) {
+                $denialReason = 'rfid_not_recognized';
+            } elseif (!$fp) {
+                $denialReason = 'fingerprint_not_recognized';
+            } elseif ($fp->user_id !== $rfid->user_id) {
+                $denialReason = 'credential_mismatch';
+            } elseif ($user->status !== 'active') {
+                $denialReason = 'user_inactive';
+            }
+        } else {
+            $denialReason = 'missing_factors';
+        }
+
+        if ($denialReason === null) {
+            $log = AccessLog::create([
+                'user_id'               => $user->id,
+                'authentication_method' => $authMethod,
+                'access_type'           => 'entry',
+                'captured_image'        => null,
+                'door_status'           => 'unlocked',
+                'date'                  => now()->toDateString(),
+                'time'                  => now()->toTimeString(),
+                'device_id'             => $deviceId,
+            ]);
+
             // Clear failed attempts counter upon successful authorized access
             Cache::forget($failKey);
 
@@ -204,6 +213,9 @@ class HardwareApiController extends Controller
             ]);
         }
 
+        $log         = $this->logDeniedAttempt($user, $denialReason, $deviceId);
+        $reasonLabel = AccessLog::DENIAL_REASONS[$denialReason] ?? $denialReason;
+
         // Increment failed attempts counter (TTL 2 minutes)
         $maxFails = config('trilock.max_failed_attempts', 5);
         $lockoutSec = config('trilock.lockout_duration', 60);
@@ -221,14 +233,15 @@ class HardwareApiController extends Controller
                 'opened_at' => null,
                 'closed_at' => null,
                 'locked_at' => now(),
-                'remarks'   => "SECURITY ALERT: Excessive failed access attempts ({$currentFails}) from {$clientKey}. Lockout activated for {$lockoutSec}s.",
+                'remarks'   => "SECURITY ALERT: Excessive failed access attempts ({$currentFails}) from {$clientKey}. Last reason: {$reasonLabel}. Lockout activated for {$lockoutSec}s.",
             ]);
 
-            Log::warning("TRILOCK: Security lockout triggered for {$clientKey} after {$currentFails} consecutive failures.");
+            Log::warning("TRILOCK: Security lockout triggered for {$clientKey} after {$currentFails} consecutive failures (last: {$denialReason}).");
 
             return response()->json([
                 'status'          => 'locked_out',
                 'message'         => "Security Lockout: Too many invalid attempts. Device locked for {$lockoutSec} seconds.",
+                'reason'          => $denialReason,
                 'lockout_seconds' => $lockoutSec,
                 'access_log_id'   => $log->id,
                 'camera_ip'       => $cameraIp,
@@ -240,12 +253,13 @@ class HardwareApiController extends Controller
             'opened_at' => null,
             'closed_at' => null,
             'locked_at' => now(),
-            'remarks'   => "ESP32 API: ACCESS DENIED - Invalid {$authMethod} credential (Attempt {$currentFails}/{$maxFails})",
+            'remarks'   => "ESP32 API: ACCESS DENIED - {$reasonLabel} via {$authMethod} (Attempt {$currentFails}/{$maxFails})",
         ]);
 
         return response()->json([
             'status'        => 'denied',
-            'message'       => "Access Denied: Invalid or inactive credential (Attempt {$currentFails}/{$maxFails})",
+            'message'       => "Access Denied: {$reasonLabel} (Attempt {$currentFails}/{$maxFails})",
+            'reason'        => $denialReason,
             'access_log_id' => $log->id,
             'attempts_left' => max(0, $maxFails - $currentFails),
             'camera_ip'     => $cameraIp,
@@ -323,8 +337,11 @@ class HardwareApiController extends Controller
             $device = $request->attributes->get('authenticated_device');
             $deviceId = $device ? $device->id : null;
         }
+        // No IP here: $request->ip() is the camera's public/NAT (or proxy) address, and
+        // overwriting the LAN IP from its heartbeat would hand the main controller an
+        // unreachable camera_ip - every capture after the first would silently fail.
         if ($deviceId) {
-            $this->touchDevice($deviceId, $request->ip());
+            $this->touchDevice($deviceId);
         }
 
         $logId = $request->input('access_log_id');
@@ -344,6 +361,7 @@ class HardwareApiController extends Controller
                 'user_id'               => null,
                 'authentication_method' => 'unauthorized',
                 'access_type'           => 'denied',
+                'denial_reason'         => 'unidentified_capture',
                 'captured_image'        => $path,
                 'door_status'           => 'locked',
                 'date'                  => now()->toDateString(),
@@ -506,6 +524,44 @@ class HardwareApiController extends Controller
     // -------------------------------------------------------------------------------------
     // Internal Helpers
     // -------------------------------------------------------------------------------------
+
+    /**
+     * Record a rejected attempt as a 'denied' access log. Also invalidates the cached
+     * dashboard status so the "last access" widget reflects it immediately.
+     */
+    private function logDeniedAttempt(?User $user, string $reason, ?int $deviceId): AccessLog
+    {
+        $log = AccessLog::create([
+            'user_id'               => $user?->id,
+            'authentication_method' => 'unauthorized',
+            'access_type'           => 'denied',
+            'denial_reason'         => $reason,
+            'captured_image'        => null,
+            'door_status'           => 'locked',
+            'date'                  => now()->toDateString(),
+            'time'                  => now()->toTimeString(),
+            'device_id'             => $deviceId,
+        ]);
+
+        Cache::forget('trilock_dashboard_status');
+
+        return $log;
+    }
+
+    /**
+     * Checks a PIN against the given user's own active PIN(s) only - not every PIN in
+     * the system - so two users sharing a PIN can't cross-match each other's card.
+     */
+    private function pinMatchesUser(string $pinCode, int $userId): bool
+    {
+        foreach (AccessPin::where('user_id', $userId)->where('status', 'active')->get() as $pin) {
+            if (Hash::check($pinCode, $pin->pin_code)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /**
      * Mark a device as online and update its last_seen timestamp.

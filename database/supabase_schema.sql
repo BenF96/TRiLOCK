@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS public.access_logs (
     user_id BIGINT REFERENCES public.users(id) ON DELETE SET NULL,
     authentication_method VARCHAR(50) NOT NULL CHECK (authentication_method IN ('rfid', 'fingerprint', 'rfid_fingerprint', 'pin', 'multi_factor', 'triple_auth', 'unauthorized', 'manual_remote')),
     access_type VARCHAR(20) NOT NULL CHECK (access_type IN ('entry', 'denied')),
+    denial_reason VARCHAR(50),
     captured_image TEXT,
     door_status VARCHAR(30) NOT NULL DEFAULT 'locked',
     date DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -184,6 +185,9 @@ CREATE INDEX IF NOT EXISTS idx_fingerprint_slot ON public.fingerprints(fingerpri
 CREATE INDEX IF NOT EXISTS idx_devices_api_token ON public.devices(api_token);
 CREATE INDEX IF NOT EXISTS idx_access_logs_user ON public.access_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_access_logs_date ON public.access_logs(date);
+
+-- Existing deployments: add the denial_reason column if the table predates it
+ALTER TABLE public.access_logs ADD COLUMN IF NOT EXISTS denial_reason VARCHAR(50);
 CREATE INDEX IF NOT EXISTS idx_enrollment_logs_session ON public.enrollment_logs(session_token);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON public.sessions(user_id);
 

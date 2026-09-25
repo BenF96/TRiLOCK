@@ -80,6 +80,9 @@
                     <p class="font-bold text-white text-sm truncate">
                         {{ $capture->user ? $capture->user->full_name : 'Unauthorized Person' }}
                     </p>
+                    @if($capture->access_type === 'denied' && $capture->denial_reason_label)
+                        <p class="text-[11px] text-rose-300/80 font-mono truncate">{{ $capture->denial_reason_label }}</p>
+                    @endif
                     <div class="flex items-center justify-between text-xs text-slate-400 font-mono">
                         <span class="text-slate-300">{{ $capture->date }}</span>
                         <span class="text-cyan-400 font-bold">{{ $capture->time }}</span>

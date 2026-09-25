@@ -71,6 +71,9 @@
 void unlockDoor();
 void lockDoor(const char* remarks);
 void denyAccess();
+void startLockout(int seconds);
+bool rejectIfLockedOut();
+void reportLocalDenial(const char* reason);
 void updateStatusLeds();
 bool isRfidCardPresent();
 bool readRfidCard(String &cardUidOut);
@@ -89,7 +92,7 @@ void enrollPinOnKeypad(String sessionToken);
 void enrollFingerprintOnSensor(String sessionToken);
 void enrollRfidOnSensor(String sessionToken);
 void sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg = "");
-void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode = "");
+void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode = "", const char* denialReason = nullptr);
 void syncOfflineCache();
 void deleteFingerprintFromSensor(int fingerprintId);
 std::vector<int> readCachedFingerprintIds(const char* path);
@@ -312,6 +315,14 @@ bool doorAjarAlarmActive = false;
 #define LED_RED_ON_MS 700
 unsigned long ledRedStart = 0;
 bool ledRedActive = false;
+
+// Brute-force lockout, mirrored from the server's "locked_out" response. While active,
+// the red LED stays on and every scan/keypress is rejected on the spot without a server
+// round-trip (the server would refuse it anyway).
+#define LOCKOUT_REJECT_TONE_GAP_MS 1500 // Don't re-sound the denial tone faster than this
+unsigned long lockoutUntilMs = 0;
+bool lockoutActive = false;
+unsigned long lastLockoutToneMs = 0;
 
 // Periodic task timestamps
 unsigned long lastHeartbeatMs = 0;
@@ -706,11 +717,54 @@ void denyAccess() {
   // Beep Error
   buzzerPlay(SND_DENIED, NOTE_COUNT(SND_DENIED), 0, BZ_PRIO_EVENT);
 
+  // A denied attempt ends the attempt - drop any credentials still staged so the next
+  // person starts from a clean 0/3 instead of inheriting half of this session.
+  resetMfaSession();
+  pinBuffer = "";
+  pinEntryActive = false;
+
   Serial.println("ACCESS DENIED");
 }
 
+void startLockout(int seconds) {
+  if (seconds <= 0) seconds = 60; // Server always sends it; fall back to its default
+  lockoutActive  = true;
+  lockoutUntilMs = millis() + (unsigned long)seconds * 1000UL;
+  digitalWrite(LED_RED, HIGH);    // Held solid for the whole lockout (see updateStatusLeds())
+  Serial.printf(">>> SECURITY LOCKOUT: rejecting all credentials for %d s <<<\n", seconds);
+}
+
+// Call at the top of each input scanner once it has actually read something. Returns
+// true (and consumes the input) while a lockout is running.
+bool rejectIfLockedOut() {
+  if (!lockoutActive) return false;
+
+  if (millis() - lastLockoutToneMs >= LOCKOUT_REJECT_TONE_GAP_MS) {
+    lastLockoutToneMs = millis();
+    buzzerPlay(SND_DENIED, NOTE_COUNT(SND_DENIED), 0, BZ_PRIO_EVENT);
+    Serial.printf("Input rejected - security lockout active (%lu s left)\n",
+      (lockoutUntilMs - millis()) / 1000UL);
+  }
+  return true;
+}
+
+// Rejections decided on-device (nothing the server could verify, e.g. a finger with no
+// matching template on the sensor) are still reported so they get logged, photographed
+// and counted toward the brute-force lockout exactly like a server-side denial.
+void reportLocalDenial(const char* reason) {
+  Serial.printf("Local denial (%s) - reporting to server...\n", reason);
+  sendAccessRequest("local_reject", "entry", currentMfaCardUid, 0, "", reason);
+  esp_task_wdt_reset(); // re-feed - the call above can block for up to ACCESS_HTTP_TIMEOUT_MS
+}
+
 void updateStatusLeds() {
-  if (ledRedActive && (millis() - ledRedStart >= LED_RED_ON_MS)) {
+  if (lockoutActive && (long)(millis() - lockoutUntilMs) >= 0) {
+    lockoutActive = false;
+    digitalWrite(LED_RED, LOW);
+    ledRedActive = false;
+    Serial.println("Security lockout expired - accepting credentials again.");
+  }
+  if (ledRedActive && !lockoutActive && (millis() - ledRedStart >= LED_RED_ON_MS)) {
     digitalWrite(LED_RED, LOW);
     ledRedActive = false;
   }
@@ -801,6 +855,7 @@ void checkRfidCard() {
   if (!readRfidCard(cardUid)) {
     return;
   }
+  if (rejectIfLockedOut()) return;
 
   currentMfaCardUid = cardUid;
   mfaSessionActive = true;
@@ -818,8 +873,18 @@ void checkRfidCard() {
 }
 
 void checkFingerprint() {
+  // After a rejected scan, wait for the finger to be lifted before reading again -
+  // otherwise one finger resting on the sensor would be re-scanned and re-reported every
+  // loop pass, burning through every lockout attempt in about a second.
+  static bool awaitingFingerLift = false;
+
   uint8_t p = finger.getImage();
+  if (awaitingFingerLift) {
+    if (p == FINGERPRINT_NOFINGER) awaitingFingerLift = false;
+    return;
+  }
   if (p != FINGERPRINT_OK) return;
+  if (rejectIfLockedOut()) return;
 
   p = finger.image2Tz();
   if (p != FINGERPRINT_OK) return;
@@ -845,12 +910,17 @@ void checkFingerprint() {
     // NOTFOUND means the sensor read the finger fine but found no library template close
     // enough to it (bad placement, wrong finger, or a template that's no longer on the
     // sensor) - anything else means the search itself errored (wiring/comms/power fault).
+    awaitingFingerLift = true;
     if (p == FINGERPRINT_NOTFOUND) {
+      // An unknown finger can never complete the 3-factor session, so without this it
+      // would never reach the server at all - no log, no photo, no lockout count.
       Serial.println("Fingerprint scan: no matching template found (bad placement, wrong finger, or template missing from sensor).");
+      reportLocalDenial("fingerprint_not_recognized");
     } else {
+      // Hardware fault, not a credential attempt - don't log it or count it.
       Serial.printf("Fingerprint scan: sensor search error (code 0x%02X) - check wiring/power, not a credential mismatch.\n", p);
+      buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
     }
-    buzzerPlayNow(SND_DENIED, NOTE_COUNT(SND_DENIED));
   }
 }
 
@@ -874,6 +944,7 @@ void checkKeypad() {
     }
     return;
   }
+  if (rejectIfLockedOut()) return;
 
   // Key pressed - feedback chirp & LED flash
   digitalWrite(LED_GREEN, HIGH);
@@ -1285,7 +1356,7 @@ void triggerCameraCapture(String cameraIp, int accessLogId) {
 // -------------------------------------------------------------------------------------
 // REST API COMMUNICATIONS
 // -------------------------------------------------------------------------------------
-void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode) {
+void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode, const char* denialReason) {
   int httpResponseCode = -1;
   String response;
 
@@ -1306,6 +1377,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     if (cardUid.length() > 0) doc["card_uid"] = cardUid;
     if (fingerprintId > 0) doc["fingerprint_id"] = fingerprintId;
     if (pinCode.length() > 0) doc["pin_code"] = pinCode;
+    if (denialReason) doc["denial_reason"] = denialReason;
     doc["device_id"] = DEVICE_ID;
 
     String jsonPayload;
@@ -1341,12 +1413,22 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
       unlockDoor();
     } else {
       int accessLogId = responseDoc["access_log_id"] | 0;
+      const char* reason = responseDoc["reason"] | "unknown";
+      Serial.printf("Server denied access: %s (HTTP %d)\n", reason, httpResponseCode);
+
       // Denied/security captures only respect the master switch - not "Record Entry
       // Captures", which only concerns successful entries.
       if (cameraEnabled && accessLogId > 0) {
         triggerCameraCapture(cameraIp, accessLogId);
       }
       denyAccess();
+
+      if (String(status) == "locked_out") {
+        startLockout(responseDoc["lockout_seconds"] | 60);
+      } else {
+        int attemptsLeft = responseDoc["attempts_left"] | -1;
+        if (attemptsLeft >= 0) Serial.printf("Attempts left before lockout: %d\n", attemptsLeft);
+      }
     }
     return;
   }

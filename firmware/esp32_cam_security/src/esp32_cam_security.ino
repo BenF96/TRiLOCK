@@ -275,13 +275,21 @@ void checkCaptureServer() {
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
 
+  // Wait for headers instead of stopping at the first lull in the TCP stream -
+  // headers split across segments used to leave Content-Length unread, so the
+  // body (access_log_id) was dropped and the photo landed on an unlinked log.
   String headerLine;
   int contentLength = 0;
-  while (client.available()) {
+  unsigned long headerTimeout = millis() + 1000;
+  while (client.connected() && millis() < headerTimeout) {
+    if (!client.available()) {
+      delay(1);
+      continue;
+    }
     headerLine = client.readStringUntil('\n');
     headerLine.trim();
     if (headerLine.startsWith("Content-Length:")) {
-      contentLength = headerLine.substring(16).toInt();
+      contentLength = headerLine.substring(15).toInt();
     }
     if (headerLine.length() == 0) break; // blank line = end of headers
   }

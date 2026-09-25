@@ -216,6 +216,9 @@
                                         <i class="fa-solid {{ $log->access_type === 'entry' ? 'fa-circle-check text-emerald-400' : 'fa-circle-xmark text-rose-400' }} mr-1.5 text-xs"></i>
                                         {{ $log->access_type }}
                                     </span>
+                                    @if($log->access_type === 'denied' && $log->denial_reason_label)
+                                        <span class="block mt-1 text-[11px] text-rose-300/80 font-mono">{{ $log->denial_reason_label }}</span>
+                                    @endif
                                 </td>
                                 <td class="py-3.5 px-3 font-mono text-xs text-slate-300">
                                     <div class="text-white">{{ $log->date }}</div>

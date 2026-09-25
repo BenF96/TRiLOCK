@@ -166,4 +166,110 @@ class HardwareApiTest extends TestCase
 
         $response->assertStatus(422);
     }
+
+    public function test_denied_multi_factor_records_reason_and_card_owner()
+    {
+        $card = RfidCard::where('status', 'active')->first();
+        $fp   = Fingerprint::where('status', 'active')->where('user_id', $card->user_id)->first();
+
+        $response = $this->postJson('/api/access', [
+            'auth_method'    => 'multi_factor',
+            'card_uid'       => $card->card_uid,
+            'fingerprint_id' => $fp->fingerprint_id,
+            'pin_code'       => '999999',
+        ]);
+
+        $response->assertStatus(403)
+            ->assertJson([
+                'status' => 'denied',
+                'reason' => 'pin_incorrect',
+            ])
+            ->assertJsonStructure(['access_log_id', 'attempts_left', 'camera_ip']);
+
+        $this->assertDatabaseHas('access_logs', [
+            'id'            => $response->json('access_log_id'),
+            'user_id'       => $card->user_id,
+            'access_type'   => 'denied',
+            'denial_reason' => 'pin_incorrect',
+        ]);
+    }
+
+    public function test_denied_multi_factor_with_unknown_card()
+    {
+        $response = $this->postJson('/api/access', [
+            'auth_method'    => 'multi_factor',
+            'card_uid'       => 'DE AD BE EF',
+            'fingerprint_id' => 1,
+            'pin_code'       => '1234',
+        ]);
+
+        $response->assertStatus(403)->assertJson(['reason' => 'rfid_not_recognized']);
+
+        $this->assertDatabaseHas('access_logs', [
+            'id'            => $response->json('access_log_id'),
+            'user_id'       => null,
+            'denial_reason' => 'rfid_not_recognized',
+        ]);
+    }
+
+    public function test_local_reject_from_device_is_logged_and_counts_toward_lockout()
+    {
+        $response = $this->postJson('/api/access', [
+            'auth_method'   => 'local_reject',
+            'denial_reason' => 'fingerprint_not_recognized',
+            'device_id'     => 1,
+        ]);
+
+        $response->assertStatus(403)
+            ->assertJson([
+                'status'        => 'denied',
+                'reason'        => 'fingerprint_not_recognized',
+                'attempts_left' => config('trilock.max_failed_attempts') - 1,
+            ]);
+
+        $this->assertDatabaseHas('access_logs', [
+            'id'            => $response->json('access_log_id'),
+            'access_type'   => 'denied',
+            'denial_reason' => 'fingerprint_not_recognized',
+            'device_id'     => 1,
+        ]);
+    }
+
+    public function test_local_reject_rejects_unknown_denial_reason()
+    {
+        $this->postJson('/api/access', [
+            'auth_method'   => 'local_reject',
+            'denial_reason' => 'something_made_up',
+        ])->assertStatus(422);
+    }
+
+    public function test_attempts_during_lockout_are_still_logged()
+    {
+        for ($i = 0; $i < config('trilock.max_failed_attempts'); $i++) {
+            $this->postJson('/api/access', [
+                'auth_method' => 'pin',
+                'pin_code'    => '9999',
+                'device_id'   => 1,
+            ]);
+        }
+
+        $response = $this->postJson('/api/access', [
+            'auth_method' => 'pin',
+            'pin_code'    => '9999',
+            'device_id'   => 1,
+        ]);
+
+        $response->assertStatus(429)
+            ->assertJson([
+                'status' => 'locked_out',
+                'reason' => 'lockout_active',
+            ])
+            ->assertJsonStructure(['access_log_id', 'lockout_seconds', 'camera_ip']);
+
+        $this->assertDatabaseHas('access_logs', [
+            'id'            => $response->json('access_log_id'),
+            'access_type'   => 'denied',
+            'denial_reason' => 'lockout_active',
+        ]);
+    }
 }

@@ -106,6 +106,27 @@ class CameraAndDoorTest extends TestCase
         $this->assertEquals($camDevice->id, AccessLog::find($response->json('access_log_id'))->device_id);
     }
 
+    public function test_esp32_cam_upload_keeps_heartbeat_lan_ip_for_capture_trigger()
+    {
+        $camDevice = Device::where('device_type', 'esp32_cam')->first();
+
+        $this->postJson('/api/heartbeat', [
+            'device_id'  => $camDevice->id,
+            'ip_address' => '192.168.1.50',
+        ])->assertStatus(200);
+
+        $this->withServerVariables(['REMOTE_ADDR' => '203.0.113.7'])
+            ->postJson('/api/upload-image', [
+                'image'     => UploadedFile::fake()->create('cam.jpg', 50, 'image/jpeg'),
+                'device_id' => $camDevice->id,
+            ])->assertStatus(200);
+
+        $this->assertEquals('192.168.1.50', $camDevice->fresh()->ip_address);
+
+        $this->postJson('/api/access', ['auth_method' => 'rfid', 'card_uid' => 'DEADBEEF'])
+            ->assertJson(['camera_ip' => '192.168.1.50']);
+    }
+
     public function test_esp32_door_status_event_update()
     {
         $response = $this->postJson('/api/door-status', [
