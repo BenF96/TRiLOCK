@@ -93,6 +93,8 @@ const int DEVICE_ID = 9;
 
 #define HTTP_TIMEOUT_MS                                                        \
   30000 // 30s timeout for cloud storage uploads / cold starts
+#define UPLOAD_ATTEMPTS 3         // Retry a failed capture upload this many times
+#define UPLOAD_RETRY_DELAY_MS 1500
 #define HEARTBEAT_INTERVAL_MS                                                  \
   30000 // 30s device keep-alive ping, matches main controller
 
@@ -356,30 +358,12 @@ bool captureAndUploadImage(int accessLogId) {
 
   Serial.printf("Captured JPEG Image Size: %u bytes\n", fb->len);
 
-  // Upload Photo to Server via HTTP Multipart POST
-  String uploadUrl = String(API_BASE_URL) + "/api/upload-image";
-  HTTPClient http;
-  WiFiClientSecure secureClient;
-  WiFiClient regularClient;
-
-  if (uploadUrl.startsWith("https://")) {
-    secureClient
-        .setInsecure(); // Bypass CA verification for Render/Cloudflare HTTPS
-    http.begin(secureClient, uploadUrl);
-  } else {
-    http.begin(regularClient, uploadUrl);
-  }
-
-  http.setTimeout(HTTP_TIMEOUT_MS);
-
-  // Add Production Authentication & Security Headers
-  http.addHeader("X-Device-Token", DEVICE_API_KEY);
-  http.addHeader("Accept", "application/json");
-
+  // Build the multipart body first, then hand the frame back to the camera
+  // driver BEFORE opening the HTTPS connection - the TLS handshake needs a
+  // large block of internal heap, and holding the frame while connecting left
+  // too little (uploads failed mid-handshake while heartbeats succeeded).
   String boundary = "----TriLockESP32CAMBoundary";
-  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
 
-  // Construct Multipart Body
   String head = "--" + boundary + "\r\n";
   head += "Content-Disposition: form-data; name=\"image\"; "
           "filename=\"capture.jpg\"\r\n";
@@ -417,7 +401,6 @@ bool captureAndUploadImage(int accessLogId) {
   if (!buffer) {
     Serial.println("Memory allocation failed for upload buffer!");
     esp_camera_fb_return(fb);
-    http.end();
     return false;
   }
 
@@ -425,23 +408,61 @@ bool captureAndUploadImage(int accessLogId) {
   memcpy(buffer, head.c_str(), head.length());
   memcpy(buffer + head.length(), fb->buf, fb->len);
   memcpy(buffer + head.length() + fb->len, tail.c_str(), tail.length());
-
-  int httpCode = http.POST(buffer, totalLen);
-  free(buffer);
   esp_camera_fb_return(fb);
 
-  if (httpCode > 0) {
-    Serial.printf("Server Response HTTP Code: %d\n", httpCode);
-    String response = http.getString();
-    Serial.println("Response: " + response);
+  String uploadUrl = String(API_BASE_URL) + "/api/upload-image";
+  bool uploaded = false;
+
+  for (int attempt = 1; attempt <= UPLOAD_ATTEMPTS && !uploaded; attempt++) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Upload aborted: Wi-Fi offline.");
+      break;
+    }
+
+    Serial.printf("Upload attempt %d/%d - free heap %u, largest internal block %u\n",
+                  attempt, UPLOAD_ATTEMPTS, ESP.getFreeHeap(),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+    // Fresh client per attempt - a failed TLS session can't be reused.
+    HTTPClient http;
+    WiFiClientSecure secureClient;
+    WiFiClient regularClient;
+
+    if (uploadUrl.startsWith("https://")) {
+      secureClient
+          .setInsecure(); // Bypass CA verification for Render/Cloudflare HTTPS
+      http.begin(secureClient, uploadUrl);
+    } else {
+      http.begin(regularClient, uploadUrl);
+    }
+
+    http.setTimeout(HTTP_TIMEOUT_MS);
+
+    // Add Production Authentication & Security Headers
+    http.addHeader("X-Device-Token", DEVICE_API_KEY);
+    http.addHeader("Accept", "application/json");
+    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+
+    int httpCode = http.POST(buffer, totalLen);
+
+    if (httpCode > 0) {
+      Serial.printf("Server Response HTTP Code: %d\n", httpCode);
+      String response = http.getString();
+      Serial.println("Response: " + response);
+      uploaded = (httpCode == 200 || httpCode == 201);
+    } else {
+      Serial.printf("HTTP POST Upload Failed: %s\n",
+                    http.errorToString(httpCode).c_str());
+    }
     http.end();
-    return (httpCode == 200 || httpCode == 201);
-  } else {
-    Serial.printf("HTTP POST Upload Failed: %s\n",
-                  http.errorToString(httpCode).c_str());
-    http.end();
-    return false;
+
+    if (!uploaded && attempt < UPLOAD_ATTEMPTS) {
+      delay(UPLOAD_RETRY_DELAY_MS);
+    }
   }
+
+  free(buffer);
+  return uploaded;
 }
 
 // -------------------------------------------------------------------------------------

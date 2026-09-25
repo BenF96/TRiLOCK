@@ -70,7 +70,7 @@ class HardwareApiController extends Controller
 
         // Update device heartbeat whenever hardware checks in
         if ($deviceId) {
-            $this->touchDevice($deviceId, $request->ip());
+            $this->touchDevice($deviceId);
         }
 
         // Current LAN IP of the ESP32-CAM (from its own heartbeat), handed back to the main
@@ -286,7 +286,7 @@ class HardwareApiController extends Controller
 
         $user = User::find($validated['user_id']);
 
-        $this->touchDevice($validated['device_id'], $request->ip());
+        $this->touchDevice($validated['device_id']);
 
         $log = AccessLog::create([
             'user_id'               => $user->id,
@@ -396,7 +396,7 @@ class HardwareApiController extends Controller
         // Update device heartbeat on every sensor event
         $deviceId = $validated['device_id'] ?? null;
         if ($deviceId) {
-            $this->touchDevice($deviceId, $request->ip());
+            $this->touchDevice($deviceId);
         }
 
         $doorLog = DoorLog::create([
@@ -425,7 +425,7 @@ class HardwareApiController extends Controller
             'ip_address' => 'nullable|string|max:45',
         ]);
 
-        $device = $this->touchDevice($validated['device_id'], $validated['ip_address'] ?? $request->ip());
+        $device = $this->touchDevice($validated['device_id'], $validated['ip_address'] ?? null);
 
         // Keyed per device — a global key would let any device's heartbeat consume a
         // command meant for a different door once more than one controller is registered.
@@ -570,7 +570,9 @@ class HardwareApiController extends Controller
 
     /**
      * Mark a device as online and update its last_seen timestamp.
-     * Accepts an optional IP address to keep the devices table current.
+     * Accepts an optional IP address to keep the devices table current - only ever the
+     * device's self-reported LAN IP (heartbeat body). Never pass $request->ip(): behind
+     * Render's proxy that's 127.0.0.1 / the NAT address, which breaks camera_ip triggers.
      */
     private function touchDevice(int $deviceId, ?string $ip = null): ?Device
     {

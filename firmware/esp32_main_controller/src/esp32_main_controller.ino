@@ -28,7 +28,8 @@
  *   is held pressed while the door is shut. There's no fixed unlock timer: after an
  *   unlock the solenoid stays energized until the switch sees the door open and then
  *   close again, and relocks the moment it closes. If nobody opens the door within
- *   UNOPENED_RELOCK_MS, it relocks anyway. Left open past DOOR_AJAR_ALARM_MS -> alarm.
+ *   UNOPENED_RELOCK_MS, it relocks anyway. Left open past DOOR_AJAR_ALARM_MS -> continuous
+ *   buzzer until the door closes, plus a "LEFT OPEN" alert on the dashboard.
  *   GPIO5 is a strapping pin, but only for SDIO slave timing - reading LOW at boot (door
  *   shut) doesn't affect normal booting.
  *
@@ -107,6 +108,7 @@ void sendHeartbeat();
 void connectWiFi();
 void maintainWiFi();
 void checkWifiResetButton();
+void checkSerialCommands();
 
 // -------------------------------------------------------------------------------------
 // CONFIGURATION & PINS
@@ -278,6 +280,10 @@ bool keyBlinkActive = false;
 #define BUZZER_IS_ACTIVE     0     // 0 = passive piezo (PWM tones), 1 = active buzzer (on/off)
 #define BUZZER_LEDC_CHANNEL  0     // LEDC channel reserved for the buzzer (ESP32 core 2.x)
 #define BUZZER_LEDC_BITS     8     // PWM resolution
+// 1 = the buzzer only sounds the credential-scan chirp, the 1s unlock / 1s lock tones
+// and the continuous door-left-open alarm; every other sound (denied, boot, Wi-Fi) is
+// silenced. Set 0 to restore them.
+#define BUZZER_DOOR_EVENTS_ONLY 1
 #define DOOR_AJAR_ALARM_MS   15000 // Sound the alarm if the door stays open this long
 #define DOOR_DEBOUNCE_MS     80    // Limit switch debounce window (lever bounce on impact)
 
@@ -295,9 +301,9 @@ WiFiServer unlockServer(UNLOCK_SERVER_PORT);
 
 // Global Variables & Timers
 bool doorClosed = true;             // Debounced limit switch state
-unsigned long unlockedAt = 0;       // When the solenoid was last energized
 bool doorOpenedSinceUnlock = false; // Relock waits for an open -> close cycle
 bool isDoorUnlocked = false;
+unsigned long unlockedAt = 0;       // When the solenoid was last energized
 
 // Settings toggles fetched from GET /api/settings (see fetchServerSettings()) - default
 // to their DB defaults so behavior is unchanged until the first successful fetch.
@@ -340,7 +346,7 @@ bool offlineQueuePending = false;
 // BUZZER SUBSYSTEM
 // -------------------------------------------------------------------------------------
 // Tones are played by a small non-blocking sequencer: buzzerPlay() starts a pattern and
-// returns immediately, buzzerUpdate() (called every loop) advances it note by note. This
+// returns immediately, buzzerUpdate() (run by its own FreeRTOS task) advances it note by note. This
 // keeps RFID / fingerprint / door polling responsive while the buzzer is sounding.
 
 struct BuzzerNote {
@@ -363,22 +369,26 @@ static const BuzzerNote SND_SCAN[]      = {{2400, 45}};
 static const BuzzerNote SND_GRANTED[]   = {{2000, 130}, {0, 50}, {2600, 190}};
 static const BuzzerNote SND_DENIED[]    = {{500, 200}, {0, 90}, {400, 340}};
 static const BuzzerNote SND_ERROR[]     = {{800, 80}, {0, 60}, {800, 80}, {0, 60}, {800, 80}};
-static const BuzzerNote SND_AJAR[]      = {{2800, 280}, {0, 320}}; // repeated until door closes
 static const BuzzerNote SND_REMOTE[]    = {{1800, 80}, {0, 40}, {2200, 80}, {0, 40}, {2600, 120}};
 static const BuzzerNote SND_DOOR_UNLOCK[] = {{2000, 1000}}; // single continuous 1s tone on unlock
 static const BuzzerNote SND_DOOR_LOCK[]   = {{1400, 1000}}; // single continuous 1s tone on lock
+static const BuzzerNote SND_AJAR[]        = {{2800, 1000}}; // looped = continuous tone until the door closes
 
-// Sequencer state
+// Sequencer state - shared between loop() and the buzzer task, guarded by bzMutex.
 static const BuzzerNote* bzSeq = nullptr;
 static uint8_t  bzLen        = 0;
 static uint8_t  bzIndex      = 0;
 static int16_t  bzRepeats    = 0;   // -1 = loop forever, otherwise remaining repeats
 static uint8_t  bzPriority   = BZ_PRIO_INFO;
-static bool     bzPlaying    = false;
+static volatile bool bzPlaying = false;
 static unsigned long bzNoteStart = 0;
 static bool     buzzerMuted  = false;
+static SemaphoreHandle_t bzMutex = nullptr;
+
+void buzzerTask(void*);
 
 void buzzerInit() {
+  bzMutex = xSemaphoreCreateMutex();
 #if BUZZER_IS_ACTIVE
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
@@ -390,6 +400,12 @@ void buzzerInit() {
   ledcAttachPin(BUZZER_PIN, BUZZER_LEDC_CHANNEL);
   ledcWrite(BUZZER_LEDC_CHANNEL, 0);
 #endif
+
+  // The sequencer runs in its own task so a tone ends on time even while loop() is
+  // stuck in a blocking HTTPClient call - driven from loop(), lockDoor()'s 1s tone
+  // lasted as long as the door-status request after it (several seconds on a cold
+  // server), which sounded like a continuous buzz.
+  xTaskCreatePinnedToCore(buzzerTask, "buzzer", 4096, nullptr, 2, nullptr, 1);
 }
 
 // Drive the buzzer at the given frequency (0 = silence).
@@ -407,18 +423,33 @@ void buzzerOutput(uint16_t freq) {
 #endif
 }
 
-void buzzerStop() {
+// Caller must hold bzMutex.
+static void buzzerStopLocked() {
   bzPlaying  = false;
   bzSeq      = nullptr;
   bzPriority = BZ_PRIO_INFO;
   buzzerOutput(0);
 }
 
+void buzzerStop() {
+  xSemaphoreTake(bzMutex, portMAX_DELAY);
+  buzzerStopLocked();
+  xSemaphoreGive(bzMutex);
+}
+
 // Start a pattern without blocking. repeats: 0 = play once, -1 = loop until buzzerStop().
 // Returns false if the request was dropped in favour of a more important sound.
 bool buzzerPlay(const BuzzerNote* seq, uint8_t len, int16_t repeats, uint8_t priority) {
   if (len == 0) return false;
-  if (bzPlaying && priority < bzPriority) return false; // never talk over a more important sound
+#if BUZZER_DOOR_EVENTS_ONLY
+  if (seq != SND_SCAN && seq != SND_DOOR_UNLOCK && seq != SND_DOOR_LOCK && seq != SND_AJAR) return false;
+#endif
+
+  xSemaphoreTake(bzMutex, portMAX_DELAY);
+  if (bzPlaying && priority < bzPriority) { // never talk over a more important sound
+    xSemaphoreGive(bzMutex);
+    return false;
+  }
 
   bzSeq       = seq;
   bzLen       = len;
@@ -428,35 +459,65 @@ bool buzzerPlay(const BuzzerNote* seq, uint8_t len, int16_t repeats, uint8_t pri
   bzPlaying   = true;
   bzNoteStart = millis();
   buzzerOutput(bzSeq[0].freq);
+  xSemaphoreGive(bzMutex);
   return true;
 }
 
-// Advance the sequencer - must be called from loop().
+// Advance the sequencer - called every few ms by buzzerTask().
 void buzzerUpdate() {
-  if (!bzPlaying) return;
-  if (millis() - bzNoteStart < bzSeq[bzIndex].ms) return;
-
-  bzIndex++;
-  if (bzIndex >= bzLen) {
-    if (bzRepeats == 0) {
-      buzzerStop();
-      return;
+  xSemaphoreTake(bzMutex, portMAX_DELAY);
+  if (bzPlaying && millis() - bzNoteStart >= bzSeq[bzIndex].ms) {
+    bzIndex++;
+    if (bzIndex >= bzLen && bzRepeats == 0) {
+      buzzerStopLocked();
+    } else {
+      if (bzIndex >= bzLen) {
+        if (bzRepeats > 0) bzRepeats--;
+        bzIndex = 0;
+      }
+      bzNoteStart = millis();
+      buzzerOutput(bzSeq[bzIndex].freq);
     }
-    if (bzRepeats > 0) bzRepeats--;
-    bzIndex = 0;
   }
-
-  bzNoteStart = millis();
-  buzzerOutput(bzSeq[bzIndex].freq);
+  xSemaphoreGive(bzMutex);
 }
 
-// Blocking variant - for setup() and for short chirps played right before an HTTP call
-// (the sequencer cannot run while HTTPClient blocks).
+void buzzerTask(void*) {
+  for (;;) {
+    buzzerUpdate();
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+// Blocking variant - waits for the pattern to finish before returning.
 void buzzerPlayNow(const BuzzerNote* seq, uint8_t len) {
   if (!buzzerPlay(seq, len, 0, BZ_PRIO_INFO)) return;
-  while (bzPlaying) {
-    buzzerUpdate();
-    delay(2);
+  while (bzPlaying) delay(2);
+}
+
+// Serial commands for bench checks:
+//   BUZZER_TEST - plays the unlock then the lock tone without touching the solenoid
+//   STATUS      - prints the limit switch reading, lock state and Wi-Fi
+void checkSerialCommands() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (cmd == "BUZZER_TEST") {
+    Serial.printf("Buzzer test on GPIO%d (%s, muted=%d): unlock tone...\n", BUZZER_PIN,
+                  BUZZER_IS_ACTIVE ? "active" : "passive/PWM", buzzerMuted);
+    buzzerPlay(SND_DOOR_UNLOCK, NOTE_COUNT(SND_DOOR_UNLOCK), 0, BZ_PRIO_EVENT);
+    while (bzPlaying) delay(5);
+    delay(500);
+    Serial.println("Buzzer test: lock tone...");
+    buzzerPlay(SND_DOOR_LOCK, NOTE_COUNT(SND_DOOR_LOCK), 0, BZ_PRIO_EVENT);
+    while (bzPlaying) delay(5);
+    Serial.println("Buzzer test done.");
+  } else if (cmd == "STATUS") {
+    Serial.printf("Limit switch GPIO%d raw=%d -> door %s | solenoid %s | auto-lock %s | Wi-Fi %s %s\n",
+                  LIMIT_SWITCH_PIN, digitalRead(LIMIT_SWITCH_PIN), doorClosed ? "CLOSED" : "OPEN",
+                  isDoorUnlocked ? "UNLOCKED" : "LOCKED", autoLockEnabled ? "on" : "off",
+                  WiFi.status() == WL_CONNECTED ? "connected" : "down",
+                  WiFi.localIP().toString().c_str());
   }
 }
 
@@ -471,6 +532,8 @@ void buzzerSetMuted(bool muted) {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  // 1=power-on 3=software 4=panic 5=int WDT 6=task WDT 7=other WDT 9=brownout
+  Serial.printf("Boot - reset reason: %d\n", (int)esp_reset_reason());
 
   // Initialize GPIO Pins
   pinMode(RELAY_PIN, OUTPUT);
@@ -582,17 +645,16 @@ void loop() {
   maintainWiFi();
   checkWifiResetButton();
 
-  // 0. Advance buzzer / LED timers (non-blocking)
-  buzzerUpdate();
+  // 0. Advance LED timers (non-blocking; the buzzer runs in its own task)
   updateStatusLeds();
+  checkSerialCommands();
 
   // 1. Monitor the door limit switch - relocks on an open -> close cycle after an unlock
   checkDoorSensor();
 
   // 2. Nobody went through: relock if the door was never opened after an unlock. Both
   // relock paths are gated by "Auto-Relock Mechanism" - when disabled, the solenoid stays
-  // energized until an explicit remote lock command arrives (see the "lock"
-  // pending_command branch in sendHeartbeat()).
+  // energized until an explicit remote lock command arrives.
   if (autoLockEnabled && isDoorUnlocked && !doorOpenedSinceUnlock &&
       millis() - unlockedAt >= UNOPENED_RELOCK_MS) {
     lockDoor("Door relocked - not opened after unlock");
@@ -686,7 +748,7 @@ void unlockDoor() {
   // Also reset keyBlink in case it was set before unlock
   keyBlinkActive = false;
 
-  // Beep Success - single continuous 2s tone on unlock
+  // Single 1s tone on unlock
   buzzerPlay(SND_DOOR_UNLOCK, NOTE_COUNT(SND_DOOR_UNLOCK), 0, BZ_PRIO_EVENT);
 
   Serial.println("DOOR UNLOCKED");
@@ -699,7 +761,7 @@ void lockDoor(const char* remarks) {
   digitalWrite(LED_GREEN, LOW);
   digitalWrite(LED_RED, LOW);
 
-  // Single continuous 2s tone on lock
+  // Single 1s tone on lock
   buzzerPlay(SND_DOOR_LOCK, NOTE_COUNT(SND_DOOR_LOCK), 0, BZ_PRIO_EVENT);
   Serial.println("DOOR LOCKED");
 
@@ -1238,7 +1300,7 @@ void checkDoorSensor() {
     doorOpenedAt = 0;
     if (doorAjarAlarmActive) {
       doorAjarAlarmActive = false;
-      buzzerStop(); // Silence the door-ajar alarm
+      buzzerStop(); // Silence the door-left-open alarm
       Serial.println("Door Ajar Alarm Cleared.");
     }
     Serial.println("Door State: CLOSED");
@@ -1251,7 +1313,8 @@ void checkDoorSensor() {
   }
 }
 
-// Continuous alarm while the door is held open past the allowed window.
+// Door held open past DOOR_AJAR_ALARM_MS: continuous buzzer until the limit switch sees
+// it close (checkDoorSensor() silences it), and a "LEFT OPEN" alert on the dashboard.
 void checkDoorAjar() {
   if (doorClosed) return;                        // Door closed - nothing to do
   if (doorAjarAlarmActive) return;               // Already sounding
@@ -1261,9 +1324,10 @@ void checkDoorAjar() {
   doorAjarAlarmActive = true;
   Serial.println("ALARM: Door left open!");
 
-  // Report first - the blocking HTTP call would otherwise stretch the alarm's first note
+  // Alarm priority - scan chirps can't cut it short. The buzzer task keeps it sounding
+  // through the blocking status report below.
+  buzzerPlay(SND_AJAR, NOTE_COUNT(SND_AJAR), -1, BZ_PRIO_ALARM);
   sendDoorStatusUpdate("left_open", "Door left open beyond allowed time - buzzer alarm active");
-  buzzerPlay(SND_AJAR, NOTE_COUNT(SND_AJAR), -1, BZ_PRIO_ALARM); // Loop until door closes
 }
 
 // -------------------------------------------------------------------------------------
@@ -1714,6 +1778,12 @@ void flushOfflineQueue() {
     int code = http.POST(jsonPayload);
     http.end();
 
+    // A 4xx (other than timeout/rate-limit) means the server will never accept this entry
+    // (e.g. the user was deleted) - drop it instead of blocking the whole queue forever.
+    if (code >= 400 && code < 500 && code != 408 && code != 429) {
+      Serial.printf("Offline queue: dropping entry %u - rejected by server (HTTP %d).\n", (unsigned)sentCount, code);
+      continue;
+    }
     if (code != 200) {
       Serial.printf("Offline queue flush stopped: entry %u failed (HTTP %d). Will retry next cycle.\n", (unsigned)sentCount, code);
       break; // stop here - keep this entry and everything after it queued for next time
@@ -1817,7 +1887,11 @@ void sendDoorStatusUpdate(String status, String remarks) {
 
   String jsonPayload;
   serializeJson(doc, jsonPayload);
+  // Can block up to HTTP_TIMEOUT_MS, and a door close sends two reports back to back
+  // ("closed" then "locked") - feed the 15s watchdog so a slow server can't reboot the lock.
+  esp_task_wdt_reset();
   http.POST(jsonPayload);
+  esp_task_wdt_reset();
   http.end();
 }
 
