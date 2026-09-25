@@ -24,16 +24,6 @@
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="sm:col-span-2">
-                        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Door Unlock Duration (Seconds) *</label>
-                        <div class="relative">
-                            <input type="number" name="door_unlock_duration" value="{{ old('door_unlock_duration', $settings->door_unlock_duration) }}" min="1" max="60" required
-                                   class="w-full pl-4 pr-14 py-3 glass-input rounded-xl text-white font-mono text-sm">
-                            <span class="absolute inset-y-0 right-0 flex items-center pr-4 text-xs text-slate-500 font-mono">SEC</span>
-                        </div>
-                        <span class="text-[11px] text-slate-400 mt-1.5 block">Time electronic solenoid holds unlatched upon successful card/biometric/PIN verification.</span>
-                    </div>
-
-                    <div class="sm:col-span-2">
                         <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Laboratory Access Zone Name *</label>
                         <input type="text" name="lab_name" value="{{ old('lab_name', $settings->lab_name) }}" required
                                class="w-full px-4 py-3 glass-input rounded-xl text-white text-sm">
@@ -50,7 +40,7 @@
                             <input type="checkbox" name="auto_lock" value="1" {{ $settings->auto_lock ? 'checked' : '' }} class="w-4 h-4 rounded bg-[#070b16] border-slate-700 text-cyan-500 focus:ring-cyan-500">
                             <div>
                                 <span class="text-xs font-bold text-white block">Auto-Relock Mechanism</span>
-                                <span class="text-[11px] text-slate-400">Lock solenoid after timer elapsed</span>
+                                <span class="text-[11px] text-slate-400">Lock solenoid when the door limit switch detects the door closed again</span>
                             </div>
                         </label>
 

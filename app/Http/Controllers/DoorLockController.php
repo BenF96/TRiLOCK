@@ -38,8 +38,7 @@ class DoorLockController extends Controller
 
     public function unlock(Request $request)
     {
-        $settings = Setting::getSettings();
-        $user     = Auth::user();
+        $user = Auth::user();
 
         $mainControllers = Device::where('device_type', 'esp32_main')->orderBy('device_name')->get();
 
@@ -83,10 +82,10 @@ class DoorLockController extends Controller
 
         // Signal the physical ESP32 hardware to fire the solenoid.
         // The ESP32 main controller runs a tiny HTTP server on port 8080.
-        $signalResult = $this->signalEsp32Unlock($device, $settings->door_unlock_duration);
+        $signalResult = $this->signalEsp32Unlock($device);
 
         if ($signalResult['success']) {
-            return back()->with('success', "Door unlocked remotely for {$settings->door_unlock_duration} seconds. ESP32 hardware confirmed.");
+            return back()->with('success', 'Door unlocked remotely. It relocks automatically once the door is opened and closed again.');
         }
 
         // Still logged — but warn the admin the hardware may not have responded
@@ -98,11 +97,14 @@ class DoorLockController extends Controller
     // -------------------------------------------------------------------------------------
 
     /**
-     * POST http://<esp32_ip>:8080/unlock  {"duration": <seconds>}
+     * POST http://<esp32_ip>:8080/unlock
+     *
+     * There's no unlock duration: the ESP32 relocks off its door limit switch once the
+     * door has been opened and closed again (or after a fallback timeout if unopened).
      *
      * Returns ['success' => bool, 'error' => string|null]
      */
-    private function signalEsp32Unlock(?Device $device, int $durationSeconds): array
+    private function signalEsp32Unlock(?Device $device): array
     {
         if (!$device) {
             return ['success' => true, 'error' => null, 'queued' => false];
@@ -111,8 +113,7 @@ class DoorLockController extends Controller
         // 1. Queue command, keyed to this specific device, for cloud / NAT-isolated ESP32
         //    polling via /api/heartbeat (works over the Internet, no inbound port needed).
         \Illuminate\Support\Facades\Cache::put("trilock_pending_command_{$device->id}", [
-            'command'   => $durationSeconds > 0 ? 'unlock' : 'lock',
-            'duration'  => $durationSeconds,
+            'command'   => 'unlock',
             'queued_at' => now()->toDateTimeString(),
         ], 60);
 
@@ -124,14 +125,11 @@ class DoorLockController extends Controller
         $url = "http://{$device->ip_address}:8080/unlock";
 
         try {
-            $response = Http::timeout(2)->post($url, [
-                'duration' => $durationSeconds,
-            ]);
+            $response = Http::timeout(2)->post($url);
 
             if ($response->successful()) {
                 Log::info("ESP32 direct unlock signal sent successfully to {$url}", [
                     'device_id' => $device->id,
-                    'duration'  => $durationSeconds,
                 ]);
                 return ['success' => true, 'error' => null];
             }

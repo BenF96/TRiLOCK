@@ -35,6 +35,7 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WiFiManager.h> // tzapu/WiFiManager - captive-portal Wi-Fi setup
 #include <WiFiServer.h>
 
 #define CAPTURE_SERVER_PORT 80
@@ -62,11 +63,24 @@
 
 #define FLASH_LED_PIN 4 // High intensity onboard LED
 
+// Image orientation (1 = on). Both on = 180 degree rotation, for a module
+// mounted upside down.
+#define CAMERA_VFLIP 1
+#define CAMERA_HMIRROR 1
+
 // -------------------------------------------------------------------------------------
 // CONFIGURATION & CREDENTIALS
 // -------------------------------------------------------------------------------------
-const char *WIFI_SSID = "Redmi Note 11";
-const char *WIFI_PASSWORD = "benben96";
+// Wi-Fi credentials are NOT compiled in - they're entered through the
+// WiFiManager captive portal and persisted in NVS (see connectWiFi()). On first
+// boot, or whenever the saved network can't be reached at boot, the camera
+// opens a "TRILOCK-Cam-XXXX" access point: join it and the setup page opens
+// automatically (or browse to 192.168.4.1). Send "WIFI_RESET" over serial to
+// forget the saved network and reopen the portal. Put the camera on the same
+// network as the main controller - it triggers captures over the LAN.
+const char *WIFI_PORTAL_PASSWORD = "trilock-setup"; // Setup AP password (min 8)
+#define WIFI_PORTAL_TIMEOUT_S 180 // Give up on the portal and keep retrying
+#define WIFI_CONNECT_TIMEOUT_S 15 // Per-attempt timeout for the saved network
 const char *API_BASE_URL = "https://trilock-lx5t.onrender.com";
 const char *DEVICE_API_KEY =
     "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
@@ -157,6 +171,16 @@ void setup() {
         err);
   } else {
     Serial.println("ESP32-CAM OV2640 Module initialized successfully!");
+
+    // The module is mounted upside down - rotate 180 degrees in-sensor (vertical
+    // flip + horizontal mirror). Toggle CAMERA_VFLIP / CAMERA_HMIRROR if the
+    // mounting changes (e.g. set only CAMERA_HMIRROR to 0 if the image ends up
+    // mirrored left-to-right).
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor) {
+      sensor->set_vflip(sensor, CAMERA_VFLIP);
+      sensor->set_hmirror(sensor, CAMERA_HMIRROR);
+    }
   }
 
   // Connect to Wi-Fi
@@ -202,7 +226,14 @@ void loop() {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
 
-    if (cmd.startsWith("CAPTURE")) {
+    if (cmd == "WIFI_RESET") {
+      Serial.println("Erasing saved Wi-Fi credentials and rebooting into "
+                     "setup portal...");
+      WiFiManager wm;
+      wm.resetSettings();
+      delay(200);
+      ESP.restart();
+    } else if (cmd.startsWith("CAPTURE")) {
       int accessLogId = 0;
 
       // Parse optional ":<id>" suffix
@@ -450,25 +481,34 @@ void sendHeartbeat() {
 // WI-FI CONNECTION
 // -------------------------------------------------------------------------------------
 void connectWiFi() {
-  Serial.print("Connecting to Wi-Fi: ");
-  Serial.println(WIFI_SSID);
+  WiFiManager wm;
+  wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_S);
+  // If no one configures it, fall through - loop() keeps retrying the saved
+  // network in the background.
+  wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
+  wm.setAPCallback([](WiFiManager *mgr) {
+    Serial.printf("Wi-Fi setup portal open - join AP \"%s\" and browse to %s\n",
+                  mgr->getConfigPortalSSID().c_str(),
+                  WiFi.softAPIP().toString().c_str());
+  });
+
+  char apName[24];
+  snprintf(apName, sizeof(apName), "TRILOCK-Cam-%04X",
+           (uint16_t)(ESP.getEfuseMac() >> 32));
+
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false); // CRITICAL: Disable modem sleep for maximum throughput
-                        // and low latency
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setAutoReconnect(true);
+  Serial.println("Connecting to saved Wi-Fi network...");
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(300);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi Connected!");
+  if (wm.autoConnect(apName, WIFI_PORTAL_PASSWORD)) {
+    Serial.printf("Wi-Fi Connected to %s\n", WiFi.SSID().c_str());
     Serial.print("ESP32-CAM IP: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("\nWi-Fi Connection Failed - Will retry periodically.");
+    Serial.println(
+        "Wi-Fi not configured/unreachable - Will retry periodically.");
   }
+
+  WiFi.setSleep(false); // CRITICAL: Disable modem sleep for maximum throughput
+                        // and low latency
 }

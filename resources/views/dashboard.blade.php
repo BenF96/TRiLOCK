@@ -120,7 +120,7 @@
 
                 <h3 class="text-2xl sm:text-3xl font-black text-white tracking-tight">Electronic Solenoid Mechanism</h3>
                 <p class="text-slate-400 text-sm max-w-2xl leading-relaxed">
-                    Automated security lockout activates dynamically after <span class="text-cyan-300 font-mono font-bold">{{ $settings->door_unlock_duration }}s</span> of valid RFID/Fingerprint/PIN verification.
+                    After a valid RFID/Fingerprint/PIN verification the solenoid stays unlatched until the door limit switch detects the door opened and <span class="text-cyan-300 font-mono font-bold">closed again</span>, then relocks automatically.
                 </p>
             </div>
 
@@ -130,7 +130,7 @@
                     @csrf
                     <button type="submit" class="px-6 py-3.5 rounded-2xl bg-linear-to-r from-emerald-500 via-teal-500 to-emerald-600 hover:from-emerald-400 hover:to-teal-400 text-white font-bold text-sm shadow-xl shadow-emerald-500/25 transition transform active:scale-95 flex items-center gap-2.5 cursor-pointer">
                         <i class="fa-solid fa-key text-base"></i>
-                        <span>Remote Unlock ({{ $settings->door_unlock_duration }}s)</span>
+                        <span>Remote Unlock</span>
                     </button>
                 </form>
             </div>

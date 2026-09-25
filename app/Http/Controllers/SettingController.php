@@ -25,14 +25,12 @@ class SettingController extends Controller
     public function update(Request $request)
     {
         $validated = $request->validate([
-            'door_unlock_duration' => 'required|integer|min:1|max:60',
             'lab_name' => 'required|string|max:255',
         ]);
 
         $settings = Setting::getSettings();
 
         $settings->update([
-            'door_unlock_duration' => $validated['door_unlock_duration'],
             'auto_lock'            => $request->has('auto_lock'),
             'camera_enabled'       => $request->has('camera_enabled'),
             'capture_entry'        => $request->has('capture_entry'),

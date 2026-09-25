@@ -59,12 +59,33 @@ php artisan serve --host=0.0.0.0 --port=8000
 In `firmware/esp32_main_controller.ino` and `firmware/esp32_cam_security.ino`:
 
 ```cpp
-const char* WIFI_SSID       = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD   = "YOUR_WIFI_PASSWORD";
 const char* SERVER_URL      = "http://192.168.1.100:8000";
 const char* DEVICE_API_KEY  = "trilock_sec_dev_key_2026";
 const char* OFFLINE_PIN_SALT = "trilock_offline_salt_change_me"; // must match TRILOCK_OFFLINE_PIN_SALT in .env
 ```
+
+### Wi-Fi setup (WiFiManager captive portal)
+
+Wi-Fi credentials are not compiled into the firmware. On first boot, or whenever the saved
+network can't be reached at boot, each board opens its own setup access point:
+
+| Board | Access point | Password |
+|---|---|---|
+| Main controller | `TRILOCK-Lock-XXXX` | `trilock-setup` |
+| ESP32-CAM | `TRILOCK-Cam-XXXX` | `trilock-setup` |
+
+Join the access point from a phone or laptop. The setup page should open by itself; if it
+doesn't, go to `http://192.168.4.1`. Pick your network, then enter its password. The
+credentials are saved to flash and survive reboots and firmware re-flashes. If nobody sets
+it up within 3 minutes, the board starts anyway without Wi-Fi (offline unlock still works)
+and keeps retrying the saved network in the background. Put both boards on the **same**
+network, because the main controller triggers camera captures over the LAN.
+
+To move a board to a different network:
+- **Main controller:** hold the **BOOT** button (GPIO0) for 5 seconds.
+- **ESP32-CAM:** send `WIFI_RESET` over the serial monitor.
+
+To change the setup AP password, edit `WIFI_PORTAL_PASSWORD` in each sketch.
 
 `esp32_main_controller.ino` keeps a synced copy of every enrolled user's RFID+fingerprint+PIN
 combo on flash and will unlock offline (server/WiFi unreachable) once all three factors match

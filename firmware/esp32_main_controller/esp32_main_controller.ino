@@ -41,6 +41,7 @@
  */
 
 #include <WiFi.h>
+#include <WiFiManager.h>    // Library: "WiFiManager" by tzapu - captive-portal Wi-Fi setup
 #include <HTTPClient.h>
 #include <WiFiServer.h>
 #include <ArduinoJson.h>
@@ -92,12 +93,25 @@ void fetchServerSettings();
 void sendDoorStatusUpdate(String status, String remarks);
 void sendHeartbeat();
 void connectWiFi();
+void maintainWiFi();
+void checkWifiResetButton();
 
 // -------------------------------------------------------------------------------------
 // CONFIGURATION & PINS
 // -------------------------------------------------------------------------------------
-const char* WIFI_SSID      = "Redmi Note 11";
-const char* WIFI_PASSWORD  = "benben96";
+// Wi-Fi credentials are NOT compiled in - they're entered through the WiFiManager
+// captive portal and persisted in NVS by the ESP32 core (see connectWiFi()). On first
+// boot, or whenever the saved network can't be reached at boot, the device opens a
+// "TRILOCK-Lock-XXXX" access point: join it, and the setup page opens automatically
+// (or browse to 192.168.4.1). Hold the BOOT button (GPIO0) for WIFI_RESET_HOLD_MS to
+// forget the saved network and reopen the portal.
+const char* WIFI_PORTAL_PASSWORD = "trilock-setup"; // Setup AP password (min 8 chars)
+#define WIFI_PORTAL_TIMEOUT_S    180   // Give up on the portal and boot offline after this
+#define WIFI_CONNECT_TIMEOUT_S   15    // Per-attempt timeout for the saved network at boot
+#define WIFI_RETRY_INTERVAL_MS   10000 // Background reconnect cadence once running
+#define WIFI_RESET_BUTTON_PIN    0     // On-board BOOT button (active LOW)
+#define WIFI_RESET_HOLD_MS       5000
+
 const char* SERVER_URL     = "https://trilock-lx5t.onrender.com"; // TRILOCK Backend Server IP
 const char* DEVICE_API_KEY = "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
 
@@ -491,7 +505,10 @@ void setup() {
   // is deliberately done once at boot rather than on every flushOfflineQueue() tick).
   offlineQueuePending = LittleFS.exists(OFFLINE_QUEUE_PATH);
 
-  // Connect to Wi-Fi Network
+  // Connect to Wi-Fi Network (opens the setup portal if no saved network is reachable).
+  // Runs before the task watchdog is armed below, since the portal blocks for up to
+  // WIFI_PORTAL_TIMEOUT_S.
+  pinMode(WIFI_RESET_BUTTON_PIN, INPUT_PULLUP);
   connectWiFi();
 
   // Fetch initial settings and offline credential cache from TRILOCK Server
@@ -536,10 +553,9 @@ void loop() {
   // Feed Hardware Watchdog Timer
   esp_task_wdt_reset();
 
-  // Maintain Wi-Fi Connection
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
-  }
+  // Maintain Wi-Fi Connection (non-blocking) and watch for a BOOT-button Wi-Fi reset
+  maintainWiFi();
+  checkWifiResetButton();
 
   // 0. Advance buzzer / LED timers (non-blocking)
   buzzerUpdate();
@@ -1759,25 +1775,77 @@ void sendHeartbeat() {
 // WI-FI CONNECTION
 // -------------------------------------------------------------------------------------
 void connectWiFi() {
-  Serial.print("Connecting to Wi-Fi: ");
-  Serial.println(WIFI_SSID);
+  WiFiManager wm;
+  wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_S);
+  // If no one configures it, fall through and boot in offline mode (local credential
+  // cache still works) - maintainWiFi() keeps retrying the saved network from loop().
+  wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
+  wm.setAPCallback([](WiFiManager* mgr) {
+    Serial.printf("Wi-Fi setup portal open - join AP \"%s\" and browse to %s\n",
+                  mgr->getConfigPortalSSID().c_str(), WiFi.softAPIP().toString().c_str());
+    buzzerPlayNow(SND_REMOTE, NOTE_COUNT(SND_REMOTE));
+  });
+
+  char apName[24];
+  snprintf(apName, sizeof(apName), "TRILOCK-Lock-%04X", (uint16_t)(ESP.getEfuseMac() >> 32));
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setAutoReconnect(true);
+  Serial.println("Connecting to saved Wi-Fi network...");
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi Connected!");
+  if (wm.autoConnect(apName, WIFI_PORTAL_PASSWORD)) {
+    Serial.printf("Wi-Fi Connected to %s\n", WiFi.SSID().c_str());
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
     buzzerPlayNow(SND_WIFI_OK, NOTE_COUNT(SND_WIFI_OK));
   } else {
-    Serial.println("\nWi-Fi Connection Failed!");
+    Serial.println("Wi-Fi not configured/unreachable - running offline, will keep retrying.");
     buzzerPlayNow(SND_WIFI_FAIL, NOTE_COUNT(SND_WIFI_FAIL));
+  }
+}
+
+// Non-blocking background reconnect using the credentials saved by the portal - never
+// reopens the portal from loop(), so a router outage can't take the lock offline for
+// WIFI_PORTAL_TIMEOUT_S (or trip the 15s watchdog).
+void maintainWiFi() {
+  static unsigned long lastRetryMs = 0;
+  static bool wasConnected = WiFi.status() == WL_CONNECTED;
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected != wasConnected) {
+    wasConnected = connected;
+    if (connected) {
+      Serial.print("Wi-Fi reconnected - IP Address: ");
+      Serial.println(WiFi.localIP());
+      buzzerPlay(SND_WIFI_OK, NOTE_COUNT(SND_WIFI_OK), 0, BZ_PRIO_INFO);
+    } else {
+      Serial.println("Wi-Fi connection lost - retrying in the background.");
+      buzzerPlay(SND_WIFI_FAIL, NOTE_COUNT(SND_WIFI_FAIL), 0, BZ_PRIO_INFO);
+    }
+  }
+
+  if (!connected && millis() - lastRetryMs >= WIFI_RETRY_INTERVAL_MS) {
+    lastRetryMs = millis();
+    WiFi.reconnect();
+  }
+}
+
+// Hold BOOT (GPIO0) for WIFI_RESET_HOLD_MS to erase the saved network and reboot into
+// the setup portal - the on-site way to move the lock to a new Wi-Fi network.
+void checkWifiResetButton() {
+  static unsigned long pressedSinceMs = 0;
+  if (digitalRead(WIFI_RESET_BUTTON_PIN) == HIGH) {
+    pressedSinceMs = 0;
+    return;
+  }
+  if (pressedSinceMs == 0) {
+    pressedSinceMs = millis();
+  } else if (millis() - pressedSinceMs >= WIFI_RESET_HOLD_MS) {
+    Serial.println("BOOT held - erasing saved Wi-Fi credentials and rebooting into setup portal...");
+    buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
+    WiFiManager wm;
+    wm.resetSettings();
+    delay(200);
+    ESP.restart();
   }
 }

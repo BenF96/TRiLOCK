@@ -33,7 +33,7 @@
 
                     <h3 class="text-2xl font-black text-white tracking-tight uppercase" x-text="$store.hardware.doorStatus.replace(/_/g, ' ')"></h3>
                     <p class="text-xs text-slate-400 mt-1 font-mono">
-                        Auto-lock timeout: <span class="text-cyan-300 font-bold">{{ $settings->door_unlock_duration }}s</span>
+                        Auto-lock: <span class="text-cyan-300 font-bold">{{ $settings->auto_lock ? 'on door close (limit switch)' : 'off' }}</span>
                     </p>
                 </div>
             </div>
@@ -61,7 +61,7 @@
                     @endif
 
                     <button type="submit" class="px-6 py-3 bg-linear-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-bold text-xs rounded-xl shadow-lg shadow-emerald-500/20 transition transform active:scale-95 flex items-center gap-2 cursor-pointer">
-                        <i class="fa-solid fa-key"></i> Remote Unlock ({{ $settings->door_unlock_duration }}s)
+                        <i class="fa-solid fa-key"></i> Remote Unlock
                     </button>
                 </form>
             </div>

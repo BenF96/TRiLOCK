@@ -157,7 +157,6 @@ class CameraAndDoorTest extends TestCase
             ->assertJson([
                 'status'          => 'ok',
                 'pending_command' => 'unlock',
-                'duration'        => 5,
             ]);
 
         // 3. Next heartbeat has no pending command (it was consumed)

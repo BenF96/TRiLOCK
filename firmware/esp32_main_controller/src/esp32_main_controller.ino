@@ -2,8 +2,7 @@
  * =====================================================================================
  * TRILOCK System - ESP32 Main Controller Firmware
  * Hardware: ESP32 Dev Module, MFRC522 RFID (SPI), Adafruit Fingerprint Sensor (UART2),
- *           Solenoid Relay, Buzzer & Status LEDs. No magnetic door contact sensor on
- *           this build (HAS_DOOR_SENSOR is 0 below).
+ *           Solenoid Relay, Buzzer, Status LEDs & Door Limit Switch (GPIO5).
  * Framework: Arduino / ESP32 Core
  * =====================================================================================
  *
@@ -24,6 +23,15 @@
  *       does not block booting. A brief chirp/pulse on power-up is normal.
  *     GPIO2 (LED_GREEN) - must not be pulled HIGH externally during boot/flashing.
  *
+ * DOOR LIMIT SWITCH & RELOCK
+ *   A lever limit switch on the door frame (COM -> GND, NO -> GPIO5, internal pull-up)
+ *   is held pressed while the door is shut. There's no fixed unlock timer: after an
+ *   unlock the solenoid stays energized until the switch sees the door open and then
+ *   close again, and relocks the moment it closes. If nobody opens the door within
+ *   UNOPENED_RELOCK_MS, it relocks anyway. Left open past DOOR_AJAR_ALARM_MS -> alarm.
+ *   GPIO5 is a strapping pin, but only for SDIO slave timing - reading LOW at boot (door
+ *   shut) doesn't affect normal booting.
+ *
  * OFFLINE UNLOCK
  *   While online, this device periodically pulls the full RFID+fingerprint+PIN combo
  *   for every enrolled user from GET /api/offline-sync and caches it to flash (LittleFS).
@@ -41,6 +49,7 @@
  */
 
 #include <WiFi.h>
+#include <WiFiManager.h>    // Library: "WiFiManager" by tzapu - captive-portal Wi-Fi setup
 #include <HTTPClient.h>
 #include <WiFiServer.h>
 #include <ArduinoJson.h>
@@ -59,8 +68,8 @@
 // -------------------------------------------------------------------------------------
 // FUNCTION PROTOTYPES
 // -------------------------------------------------------------------------------------
-void unlockDoor(int durationSeconds);
-void lockDoor();
+void unlockDoor();
+void lockDoor(const char* remarks);
 void denyAccess();
 void updateStatusLeds();
 bool isRfidCardPresent();
@@ -93,12 +102,25 @@ void fetchServerSettings();
 void sendDoorStatusUpdate(String status, String remarks);
 void sendHeartbeat();
 void connectWiFi();
+void maintainWiFi();
+void checkWifiResetButton();
 
 // -------------------------------------------------------------------------------------
 // CONFIGURATION & PINS
 // -------------------------------------------------------------------------------------
-const char* WIFI_SSID      = "Redmi Note 11";
-const char* WIFI_PASSWORD  = "benben96";
+// Wi-Fi credentials are NOT compiled in - they're entered through the WiFiManager
+// captive portal and persisted in NVS by the ESP32 core (see connectWiFi()). On first
+// boot, or whenever the saved network can't be reached at boot, the device opens a
+// "TRILOCK-Lock-XXXX" access point: join it, and the setup page opens automatically
+// (or browse to 192.168.4.1). Hold the BOOT button (GPIO0) for WIFI_RESET_HOLD_MS to
+// forget the saved network and reopen the portal.
+const char* WIFI_PORTAL_PASSWORD = "trilock-setup"; // Setup AP password (min 8 chars)
+#define WIFI_PORTAL_TIMEOUT_S    180   // Give up on the portal and boot offline after this
+#define WIFI_CONNECT_TIMEOUT_S   15    // Per-attempt timeout for the saved network at boot
+#define WIFI_RETRY_INTERVAL_MS   10000 // Background reconnect cadence once running
+#define WIFI_RESET_BUTTON_PIN    0     // On-board BOOT button (active LOW)
+#define WIFI_RESET_HOLD_MS       5000
+
 const char* SERVER_URL     = "https://trilock-lx5t.onrender.com"; // TRILOCK Backend Server IP
 const char* DEVICE_API_KEY = "trilock_sec_dev_key_2026"; // Matches TRILOCK_DEVICE_API_KEY
 
@@ -240,20 +262,21 @@ bool keyBlinkActive = false;
 #define LED_GREEN       21  // Status LED Green (Access Granted)
 #define LED_RED         22  // Status LED Red (Access Denied)
 
-// No magnetic door contact sensor on this build. GPIO23 is NOT free - it's MOSI_PIN
-// above, shared with the RFID reader's SPI bus - so the door sensor uses GPIO5 instead
-// (unused anywhere else in this pin map). If you add one later, set HAS_DOOR_SENSOR to 1
-// and wire the reed switch to GPIO5 to enable door-ajar monitoring (see
-// checkDoorSensor()/checkDoorAjar()).
-#define HAS_DOOR_SENSOR  0
-#define DOOR_SENSOR_PIN  5  // Only read when HAS_DOOR_SENSOR is 1 — currently unused
+// Door limit switch - drives relock (see DOOR LIMIT SWITCH & RELOCK above). GPIO23 is
+// NOT free - it's MOSI_PIN above, shared with the RFID reader's SPI bus - so the switch
+// uses GPIO5 (unused anywhere else in this pin map). Wire COM -> GND and the NO contact
+// -> GPIO5 so the pin reads LOW while the lever is pressed (door shut). If you wire the
+// NC contact instead, flip LIMIT_SWITCH_CLOSED_LEVEL to HIGH.
+#define LIMIT_SWITCH_PIN          5
+#define LIMIT_SWITCH_CLOSED_LEVEL LOW
+#define UNOPENED_RELOCK_MS        30000 // Relock if the door is never opened after an unlock
 
 // Buzzer Behaviour
 #define BUZZER_IS_ACTIVE     0     // 0 = passive piezo (PWM tones), 1 = active buzzer (on/off)
 #define BUZZER_LEDC_CHANNEL  0     // LEDC channel reserved for the buzzer (ESP32 core 2.x)
 #define BUZZER_LEDC_BITS     8     // PWM resolution
 #define DOOR_AJAR_ALARM_MS   15000 // Sound the alarm if the door stays open this long
-#define DOOR_DEBOUNCE_MS     50    // Reed switch debounce window
+#define DOOR_DEBOUNCE_MS     80    // Limit switch debounce window (lever bounce on impact)
 
 // Periodic task intervals (ms)
 #define HEARTBEAT_INTERVAL_MS       30000  // 30s device keep-alive ping
@@ -268,19 +291,19 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 WiFiServer unlockServer(UNLOCK_SERVER_PORT);
 
 // Global Variables & Timers
-int doorUnlockDuration = 5; // Default 5s (updated from server settings)
-bool lastDoorState = HIGH;  // HIGH = Door Closed, LOW = Door Opened
-unsigned long lockTimer = 0;
+bool doorClosed = true;             // Debounced limit switch state
+unsigned long unlockedAt = 0;       // When the solenoid was last energized
+bool doorOpenedSinceUnlock = false; // Relock waits for an open -> close cycle
 bool isDoorUnlocked = false;
 
 // Settings toggles fetched from GET /api/settings (see fetchServerSettings()) - default
 // to their DB defaults so behavior is unchanged until the first successful fetch.
-bool autoLockEnabled     = true; // "Auto-Relock Mechanism": re-engage solenoid when the unlock timer expires
+bool autoLockEnabled     = true; // "Auto-Relock Mechanism": re-engage solenoid when the door closes again
 bool cameraEnabled       = true; // "ESP32-CAM Snapshot": master switch for triggering any capture at all
 bool captureEntryEnabled = true; // "Record Entry Captures": also capture on successful/granted entries
 
-// Door sensor debounce / ajar tracking
-bool rawDoorState = HIGH;
+// Limit switch debounce / ajar tracking
+bool rawDoorClosed = true;
 unsigned long doorChangeTimer = 0;
 unsigned long doorOpenedAt = 0;
 bool doorAjarAlarmActive = false;
@@ -453,13 +476,12 @@ void setup() {
   buzzerPlayNow(SND_BOOT, NOTE_COUNT(SND_BOOT));
   Serial.println("Buzzer Initialized.");
 
-#if HAS_DOOR_SENSOR
-  pinMode(DOOR_SENSOR_PIN, INPUT_PULLUP);
-  // Seed the door sensor state so we do not fire a bogus event on the first loop
-  lastDoorState = digitalRead(DOOR_SENSOR_PIN);
-  rawDoorState  = lastDoorState;
-  if (lastDoorState == LOW) doorOpenedAt = millis();
-#endif
+  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+  // Seed the switch state so we do not fire a bogus event on the first loop
+  doorClosed    = digitalRead(LIMIT_SWITCH_PIN) == LIMIT_SWITCH_CLOSED_LEVEL;
+  rawDoorClosed = doorClosed;
+  if (!doorClosed) doorOpenedAt = millis();
+  Serial.printf("Door limit switch: %s\n", doorClosed ? "CLOSED" : "OPEN");
 
   // Initialize SPI & MFRC522 RFID Reader (explicit pins - do not share the default
   // VSPI pins with anything else, see Pin Definitions above)
@@ -497,7 +519,10 @@ void setup() {
   // is deliberately done once at boot rather than on every flushOfflineQueue() tick).
   offlineQueuePending = LittleFS.exists(OFFLINE_QUEUE_PATH);
 
-  // Connect to Wi-Fi Network
+  // Connect to Wi-Fi Network (opens the setup portal if no saved network is reachable).
+  // Runs before the task watchdog is armed below, since the portal blocks for up to
+  // WIFI_PORTAL_TIMEOUT_S.
+  pinMode(WIFI_RESET_BUTTON_PIN, INPUT_PULLUP);
   connectWiFi();
 
   // Fetch initial settings and offline credential cache from TRILOCK Server
@@ -542,30 +567,28 @@ void loop() {
   // Feed Hardware Watchdog Timer
   esp_task_wdt_reset();
 
-  // Maintain Wi-Fi Connection
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
-  }
+  // Maintain Wi-Fi Connection (non-blocking) and watch for a BOOT-button Wi-Fi reset
+  maintainWiFi();
+  checkWifiResetButton();
 
   // 0. Advance buzzer / LED timers (non-blocking)
   buzzerUpdate();
   updateStatusLeds();
 
-  // 1. Check Solenoid Lock Timer - gated by "Auto-Relock Mechanism". When disabled, the
-  // solenoid stays energized past the timer until an explicit remote lock command arrives
-  // (see the "lock" pending_command branch in sendHeartbeat()), so isDoorUnlocked/lockTimer
-  // are deliberately left untouched rather than silently clearing the unlocked state.
-  if (autoLockEnabled && isDoorUnlocked && (millis() - lockTimer >= (unsigned long)(doorUnlockDuration * 1000))) {
-    lockDoor();
-  }
-
-#if HAS_DOOR_SENSOR
-  // 2. Monitor Magnetic Door Contact Sensor
+  // 1. Monitor the door limit switch - relocks on an open -> close cycle after an unlock
   checkDoorSensor();
+
+  // 2. Nobody went through: relock if the door was never opened after an unlock. Both
+  // relock paths are gated by "Auto-Relock Mechanism" - when disabled, the solenoid stays
+  // energized until an explicit remote lock command arrives (see the "lock"
+  // pending_command branch in sendHeartbeat()).
+  if (autoLockEnabled && isDoorUnlocked && !doorOpenedSinceUnlock &&
+      millis() - unlockedAt >= UNOPENED_RELOCK_MS) {
+    lockDoor("Door relocked - not opened after unlock");
+  }
 
   // 3. Sound the alarm if the door was left hanging open
   checkDoorAjar();
-#endif
 
   // 4. Scan for RFID Card Swipe
   checkRfidCard();
@@ -639,10 +662,11 @@ void loop() {
 // -------------------------------------------------------------------------------------
 // HARDWARE ACCESS CONTROLS
 // -------------------------------------------------------------------------------------
-void unlockDoor(int durationSeconds) {
+void unlockDoor() {
   isDoorUnlocked = true;
-  doorUnlockDuration = durationSeconds;
-  lockTimer = millis();
+  unlockedAt = millis();
+  // Already standing open (e.g. remote unlock while propped) - the next close relocks
+  doorOpenedSinceUnlock = !doorClosed;
 
   digitalWrite(RELAY_PIN, HIGH); // Energize Solenoid
   digitalWrite(LED_GREEN, HIGH);
@@ -657,8 +681,9 @@ void unlockDoor(int durationSeconds) {
   Serial.println("DOOR UNLOCKED");
 }
 
-void lockDoor() {
+void lockDoor(const char* remarks) {
   isDoorUnlocked = false;
+  doorOpenedSinceUnlock = false;
   digitalWrite(RELAY_PIN, LOW); // De-energize Solenoid
   digitalWrite(LED_GREEN, LOW);
   digitalWrite(LED_RED, LOW);
@@ -668,10 +693,8 @@ void lockDoor() {
   Serial.println("DOOR LOCKED");
 
   // Report the real relock so the dashboard's door status doesn't stay stuck on
-  // "unlocked" until the next access attempt - this used to be silent, so a device
-  // with no physical door sensor (HAS_DOOR_SENSOR=0, the common case) never told the
-  // server the solenoid had re-engaged.
-  sendDoorStatusUpdate("locked", "Door auto-relocked after unlock timer expired");
+  // "unlocked" until the next access attempt.
+  sendDoorStatusUpdate("locked", remarks);
 }
 
 void denyAccess() {
@@ -1122,23 +1145,24 @@ void sendEnrollmentResult(String type, String token, String status, String value
 
 
 void checkDoorSensor() {
-  bool currentDoorState = digitalRead(DOOR_SENSOR_PIN);
+  bool closedNow = digitalRead(LIMIT_SWITCH_PIN) == LIMIT_SWITCH_CLOSED_LEVEL;
 
   // Non-blocking debounce - the reading must stay stable for DOOR_DEBOUNCE_MS
-  if (currentDoorState != rawDoorState) {
-    rawDoorState = currentDoorState;
+  if (closedNow != rawDoorClosed) {
+    rawDoorClosed = closedNow;
     doorChangeTimer = millis();
     return;
   }
-  if (currentDoorState == lastDoorState) return;
+  if (closedNow == doorClosed) return;
   if (millis() - doorChangeTimer < DOOR_DEBOUNCE_MS) return;
 
-  lastDoorState = currentDoorState;
+  doorClosed = closedNow;
 
-  if (currentDoorState == LOW) {
+  if (!doorClosed) {
     doorOpenedAt = millis();
+    if (isDoorUnlocked) doorOpenedSinceUnlock = true;
     Serial.println("Door State: OPENED");
-    sendDoorStatusUpdate("opened", "Door physical contact opened");
+    sendDoorStatusUpdate("opened", "Door limit switch released - door opened");
   } else {
     doorOpenedAt = 0;
     if (doorAjarAlarmActive) {
@@ -1147,13 +1171,18 @@ void checkDoorSensor() {
       Serial.println("Door Ajar Alarm Cleared.");
     }
     Serial.println("Door State: CLOSED");
-    sendDoorStatusUpdate("closed", "Door physical contact closed");
+    sendDoorStatusUpdate("closed", "Door limit switch pressed - door closed");
+
+    // Person went through and the door swung shut - re-engage the solenoid now
+    if (autoLockEnabled && isDoorUnlocked && doorOpenedSinceUnlock) {
+      lockDoor("Door relocked after it was closed");
+    }
   }
 }
 
 // Continuous alarm while the door is held open past the allowed window.
 void checkDoorAjar() {
-  if (lastDoorState != LOW) return;              // Door closed - nothing to do
+  if (doorClosed) return;                        // Door closed - nothing to do
   if (doorAjarAlarmActive) return;               // Already sounding
   if (doorOpenedAt == 0) return;
   if (millis() - doorOpenedAt < DOOR_AJAR_ALARM_MS) return;
@@ -1209,23 +1238,16 @@ void checkRemoteUnlockServer() {
     if (client.available()) body += (char)client.read();
   }
 
-  int unlockSecs = doorUnlockDuration; // default to current setting
-  if (body.length() > 0) {
-    StaticJsonDocument<128> bodyDoc;
-    if (!deserializeJson(bodyDoc, body)) {
-      unlockSecs = bodyDoc["duration"] | doorUnlockDuration;
-    }
-  }
 
   bool isUnlockRequest = requestLine.startsWith("POST /unlock");
   String httpResponse;
 
   if (isUnlockRequest) {
-    unlockDoor(unlockSecs);
+    unlockDoor();
     buzzerPlay(SND_REMOTE, NOTE_COUNT(SND_REMOTE), 0, BZ_PRIO_EVENT);
-    Serial.printf("Remote unlock executed: %ds\n", unlockSecs);
+    Serial.println("Remote unlock executed - relocks when the door closes");
     httpResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-                   "{\"status\":\"unlocked\",\"duration\":" + String(unlockSecs) + "}";
+                   "{\"status\":\"unlocked\"}";
   } else {
     httpResponse = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
                    "{\"status\":\"error\",\"message\":\"Unknown command\"}";
@@ -1301,7 +1323,6 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     const char* status = responseDoc["status"];
     String cameraIp = responseDoc["camera_ip"] | "";
     if (String(status) == "granted") {
-      int unlockSecs = responseDoc["unlock_duration"] | 5;
       int accessLogId = responseDoc["access_log_id"] | 0;
 
       // 1. Trigger ESP32-CAM to capture photo BEFORE unlocking the door - gated by both
@@ -1317,7 +1338,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
       }
 
       // 2. Unlock Solenoid Door
-      unlockDoor(unlockSecs);
+      unlockDoor();
     } else {
       int accessLogId = responseDoc["access_log_id"] | 0;
       // Denied/security captures only respect the master switch - not "Record Entry
@@ -1343,7 +1364,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
   if (method == "multi_factor" && attemptOfflineUnlock(cardUid, fingerprintId, pinCode, offlineUserId)) {
     Serial.println(">>> OFFLINE ACCESS GRANTED (matched local cache) <<<");
     buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
-    unlockDoor(doorUnlockDuration); // last value fetched from /api/settings while online
+    unlockDoor();
     // No live server round-trip happened, so this event never reached the dashboard and
     // no CAPTURE was sent (no access_log_id to attach a photo to). Queue it for backfill
     // sync so it still shows up once the server is reachable again.
@@ -1672,11 +1693,6 @@ void fetchServerSettings() {
     StaticJsonDocument<512> doc;
     deserializeJson(doc, response);
 
-    doorUnlockDuration = doc["data"]["door_unlock_duration"] | 5;
-    Serial.print("Settings refreshed — unlock duration: ");
-    Serial.print(doorUnlockDuration);
-    Serial.println("s");
-
     bool buzzerEnabled = doc["data"]["buzzer_enabled"] | true;
     buzzerSetMuted(!buzzerEnabled);
     Serial.print("Buzzer: ");
@@ -1696,7 +1712,7 @@ void fetchServerSettings() {
 }
 
 void sendDoorStatusUpdate(String status, String remarks) {
-  // 'opened'/'closed' come from the physical door contact sensor (checkDoorSensor()),
+  // 'opened'/'closed' come from the door limit switch (checkDoorSensor()),
   // 'left_open' from the ajar alarm (checkDoorAjar()), 'locked' from the solenoid
   // re-engaging (lockDoor()). Was previously hardcoded to only 'opened'/'closed', which
   // silently dropped every "left_open" alarm call below - it never reached the server.
@@ -1752,13 +1768,12 @@ void sendHeartbeat() {
 
     const char* pendingCmd = respDoc["pending_command"];
     if (pendingCmd && String(pendingCmd) == "unlock") {
-      int unlockSecs = respDoc["duration"] | doorUnlockDuration;
-      Serial.printf(">>> CLOUD REMOTE UNLOCK COMMAND RECEIVED! Duration: %ds\n", unlockSecs);
-      unlockDoor(unlockSecs);
+      Serial.println(">>> CLOUD REMOTE UNLOCK COMMAND RECEIVED!");
+      unlockDoor();
       buzzerPlay(SND_REMOTE, NOTE_COUNT(SND_REMOTE), 0, BZ_PRIO_EVENT);
     } else if (pendingCmd && String(pendingCmd) == "lock") {
       Serial.println(">>> CLOUD REMOTE LOCK COMMAND RECEIVED!");
-      lockDoor();
+      lockDoor("Door locked by remote command");
     } else if (pendingCmd && (String(pendingCmd) == "sync_offline" || String(pendingCmd) == "delete_fingerprint")) {
       Serial.println(">>> CLOUD SYNC/DELETE CREDENTIAL COMMAND RECEIVED!");
       if (respDoc.containsKey("deleted_fingerprint_ids")) {
@@ -1786,25 +1801,77 @@ void sendHeartbeat() {
 // WI-FI CONNECTION
 // -------------------------------------------------------------------------------------
 void connectWiFi() {
-  Serial.print("Connecting to Wi-Fi: ");
-  Serial.println(WIFI_SSID);
+  WiFiManager wm;
+  wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_S);
+  // If no one configures it, fall through and boot in offline mode (local credential
+  // cache still works) - maintainWiFi() keeps retrying the saved network from loop().
+  wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
+  wm.setAPCallback([](WiFiManager* mgr) {
+    Serial.printf("Wi-Fi setup portal open - join AP \"%s\" and browse to %s\n",
+                  mgr->getConfigPortalSSID().c_str(), WiFi.softAPIP().toString().c_str());
+    buzzerPlayNow(SND_REMOTE, NOTE_COUNT(SND_REMOTE));
+  });
+
+  char apName[24];
+  snprintf(apName, sizeof(apName), "TRILOCK-Lock-%04X", (uint16_t)(ESP.getEfuseMac() >> 32));
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setAutoReconnect(true);
+  Serial.println("Connecting to saved Wi-Fi network...");
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi Connected!");
+  if (wm.autoConnect(apName, WIFI_PORTAL_PASSWORD)) {
+    Serial.printf("Wi-Fi Connected to %s\n", WiFi.SSID().c_str());
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
     buzzerPlayNow(SND_WIFI_OK, NOTE_COUNT(SND_WIFI_OK));
   } else {
-    Serial.println("\nWi-Fi Connection Failed!");
+    Serial.println("Wi-Fi not configured/unreachable - running offline, will keep retrying.");
     buzzerPlayNow(SND_WIFI_FAIL, NOTE_COUNT(SND_WIFI_FAIL));
+  }
+}
+
+// Non-blocking background reconnect using the credentials saved by the portal - never
+// reopens the portal from loop(), so a router outage can't take the lock offline for
+// WIFI_PORTAL_TIMEOUT_S (or trip the 15s watchdog).
+void maintainWiFi() {
+  static unsigned long lastRetryMs = 0;
+  static bool wasConnected = WiFi.status() == WL_CONNECTED;
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected != wasConnected) {
+    wasConnected = connected;
+    if (connected) {
+      Serial.print("Wi-Fi reconnected - IP Address: ");
+      Serial.println(WiFi.localIP());
+      buzzerPlay(SND_WIFI_OK, NOTE_COUNT(SND_WIFI_OK), 0, BZ_PRIO_INFO);
+    } else {
+      Serial.println("Wi-Fi connection lost - retrying in the background.");
+      buzzerPlay(SND_WIFI_FAIL, NOTE_COUNT(SND_WIFI_FAIL), 0, BZ_PRIO_INFO);
+    }
+  }
+
+  if (!connected && millis() - lastRetryMs >= WIFI_RETRY_INTERVAL_MS) {
+    lastRetryMs = millis();
+    WiFi.reconnect();
+  }
+}
+
+// Hold BOOT (GPIO0) for WIFI_RESET_HOLD_MS to erase the saved network and reboot into
+// the setup portal - the on-site way to move the lock to a new Wi-Fi network.
+void checkWifiResetButton() {
+  static unsigned long pressedSinceMs = 0;
+  if (digitalRead(WIFI_RESET_BUTTON_PIN) == HIGH) {
+    pressedSinceMs = 0;
+    return;
+  }
+  if (pressedSinceMs == 0) {
+    pressedSinceMs = millis();
+  } else if (millis() - pressedSinceMs >= WIFI_RESET_HOLD_MS) {
+    Serial.println("BOOT held - erasing saved Wi-Fi credentials and rebooting into setup portal...");
+    buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
+    WiFiManager wm;
+    wm.resetSettings();
+    delay(200);
+    ESP.restart();
   }
 }
