@@ -51,9 +51,22 @@
                             x-data="{
                                 deviceId: {{ $device->id }},
                                 fallback: '{{ $device->isOnline() ? 'online' : 'offline' }}',
+                                fallbackSeen: '{{ $device->last_seen ? $device->last_seen->diffForHumans() : 'Never connected' }}',
+                                get liveDevice() {
+                                    return $store.hardware.devices.find(x => x.id === this.deviceId);
+                                },
                                 get liveStatus() {
-                                    const d = $store.hardware.devices.find(x => x.id === this.deviceId);
-                                    return d ? d.status : this.fallback;
+                                    return this.liveDevice ? this.liveDevice.status : this.fallback;
+                                },
+                                get lastSeen() {
+                                    const d = this.liveDevice;
+                                    if (!d) return this.fallbackSeen;
+                                    if (!d.last_seen) return 'Never connected';
+                                    const s = Math.max(0, Math.round((Date.now() - new Date(d.last_seen)) / 1000));
+                                    if (s < 60) return s + 's ago';
+                                    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+                                    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+                                    return Math.floor(s / 86400) + 'd ago';
                                 }
                             }">
                             <td class="py-3.5 px-3">
@@ -75,7 +88,7 @@
                                 @endif
                             </td>
                             <td class="py-3.5 px-3 text-xs font-mono text-slate-400">
-                                {{ $device->last_seen ? $device->last_seen->diffForHumans() : 'Never connected' }}
+                                <span x-text="lastSeen">{{ $device->last_seen ? $device->last_seen->diffForHumans() : 'Never connected' }}</span>
                             </td>
                             <td class="py-3.5 px-3">
                                 <span class="px-2.5 py-1 rounded-lg text-xs font-mono font-bold uppercase tracking-wider border inline-flex items-center gap-1.5"

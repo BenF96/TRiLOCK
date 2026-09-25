@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Device;
 use App\Services\EnrollmentService;
 use App\Services\Esp32EnrollmentClient;
 use Illuminate\Http\Request;
@@ -36,6 +37,14 @@ class EnrollmentApiController extends Controller
     public function poll(Request $request)
     {
         $token = $request->query('session_token');
+
+        // This 3s poll is the main controller's most frequent check-in - count it so
+        // last_seen stays current between its 30s heartbeats.
+        if ($pollingDevice = Device::find((int) $request->query('device_id'))) {
+            if ($pollingDevice->markSeen()) {
+                Cache::forget('trilock_dashboard_status');
+            }
+        }
 
         if (!$token) {
             $deviceId = $request->query('device_id');
@@ -71,9 +80,12 @@ class EnrollmentApiController extends Controller
      */
     public function pinResult(Request $request)
     {
+        // Failure reports from the firmware carry an empty value ("pin": "", "fingerprint_id": 0),
+        // so the value is only validated on success - otherwise every failure 422'd and the
+        // wizard never saw the device's error message.
         $validated = $request->validate([
             'session_token' => 'required|string|max:64',
-            'pin'           => 'required|string|max:8',
+            'pin'           => 'exclude_unless:status,success|required|string|max:8',
             'status'        => 'required|string|in:success,failed',
             'message'       => 'nullable|string',
         ]);
@@ -115,7 +127,7 @@ class EnrollmentApiController extends Controller
     {
         $validated = $request->validate([
             'session_token'  => 'required|string|max:64',
-            'fingerprint_id' => 'required|integer|min:1|max:127',
+            'fingerprint_id' => 'exclude_unless:status,success|required|integer|min:1|max:127',
             'status'         => 'required|string|in:success,failed',
             'message'        => 'nullable|string',
         ]);
@@ -157,7 +169,7 @@ class EnrollmentApiController extends Controller
     {
         $validated = $request->validate([
             'session_token' => 'required|string|max:64',
-            'rfid_uid'      => 'required|string|max:50',
+            'rfid_uid'      => 'exclude_unless:status,success|required|string|max:50',
             'status'        => 'required|string|in:success,failed',
             'message'       => 'nullable|string',
         ]);

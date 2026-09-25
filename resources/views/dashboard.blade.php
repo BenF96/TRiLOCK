@@ -98,13 +98,11 @@
             <div class="space-y-3">
                 <div class="flex flex-wrap items-center gap-3">
                     <span class="px-3.5 py-1.5 rounded-full text-xs font-mono font-extrabold uppercase tracking-wider border shadow-md transition-all duration-500 flex items-center gap-2"
-                          :class="$store.hardware.doorStatus === 'unlocked'
-                              ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-emerald-500/20'
-                              : 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30 shadow-cyan-500/10'">
-                        <span class="w-2 h-2 rounded-full animate-ping"
-                              :class="$store.hardware.doorStatus === 'unlocked' ? 'bg-emerald-400' : 'bg-cyan-400'"></span>
-                        <i :class="$store.hardware.doorStatus === 'unlocked' ? 'fa-solid fa-lock-open' : 'fa-solid fa-lock'"></i>
-                        <span>DOOR STATUS: <strong x-text="$store.hardware.doorStatus.replace(/_/g,' ').toUpperCase()"></strong></span>
+                          :class="$store.hardware.doorToneClass('badge')">
+                        <span class="w-2 h-2 rounded-full"
+                              :class="[$store.hardware.doorToneClass('dot'), $store.hardware.doorLive ? 'animate-ping' : '']"></span>
+                        <i class="fa-solid" :class="$store.hardware.door().icon"></i>
+                        <span>DOOR STATUS: <strong x-text="$store.hardware.door().label"></strong></span>
                     </span>
 
                     <span class="text-xs font-mono text-slate-400 px-3 py-1 rounded-lg bg-slate-900/80 border border-slate-800">

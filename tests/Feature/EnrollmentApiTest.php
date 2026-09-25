@@ -132,4 +132,29 @@ class EnrollmentApiTest extends TestCase
         $session = $service->getSession($token);
         $this->assertEquals(12, $session['fingerprint_id']);
     }
+
+    /**
+     * Payloads exactly as the firmware's sendEnrollmentResult() sends them on failure:
+     * the value field is present but empty ("" / 0).
+     */
+    public function test_device_failure_reports_with_empty_values_are_recorded()
+    {
+        $cases = [
+            ['pin', ['pin' => ''], 'Timeout: No PIN typed on keypad.', Esp32EnrollmentClient::pinCacheKey(...)],
+            ['fingerprint', ['fingerprint_id' => 0], 'Fingerprint templates do not match.', Esp32EnrollmentClient::fingerprintCacheKey(...)],
+            ['rfid', ['rfid_uid' => ''], 'Timeout: No RFID card tapped.', Esp32EnrollmentClient::rfidCacheKey(...)],
+        ];
+
+        foreach ($cases as [$type, $value, $message, $cacheKey]) {
+            $token = "fail_token_{$type}";
+
+            $this->postJson("/api/esp32/enroll/{$type}/result", [
+                'session_token' => $token,
+                'status'        => 'failed',
+                'message'       => $message,
+            ] + $value)->assertStatus(200)->assertJson(['status' => 'ok']);
+
+            $this->assertEquals(['status' => 'error', 'message' => $message], Cache::get($cacheKey($token)));
+        }
+    }
 }

@@ -19,19 +19,19 @@
                     </span>
                     <span class="flex items-center gap-1.5 text-xs font-mono">
                         <span class="w-2 h-2 rounded-full transition-colors duration-500"
-                              :class="$store.hardware.doorStatus === 'unlocked' ? 'bg-emerald-400 pulse-online' : 'bg-slate-600'"></span>
-                        <span class="text-slate-400" x-text="$store.hardware.doorStatus === 'unlocked' ? 'ENERGIZED' : 'SECURED'"></span>
+                              :class="!$store.hardware.doorLive ? 'bg-slate-600' : ($store.hardware.door().energized ? 'bg-emerald-400 pulse-online' : 'bg-slate-600')"></span>
+                        <span class="text-slate-400" x-text="!$store.hardware.doorLive ? 'NO SIGNAL' : ($store.hardware.door().energized ? 'ENERGIZED' : 'SECURED')"></span>
                         <span class="text-slate-600" x-text="$store.hardware.lastRefreshed ? ('· ' + $store.hardware.lastRefreshed) : ''"></span>
                     </span>
                 </div>
 
                 <div class="my-6 text-center">
                     <div class="relative w-24 h-24 rounded-3xl mx-auto flex items-center justify-center text-4xl mb-4 transition duration-500"
-                         :class="$store.hardware.doorStatus === 'unlocked' ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40 shadow-xl shadow-emerald-500/20' : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 shadow-xl shadow-cyan-500/10'">
-                        <i class="fa-solid" :class="$store.hardware.doorStatus === 'unlocked' ? 'fa-lock-open' : 'fa-lock'"></i>
+                         :class="$store.hardware.doorToneClass('tile')">
+                        <i class="fa-solid" :class="$store.hardware.door().icon"></i>
                     </div>
 
-                    <h3 class="text-2xl font-black text-white tracking-tight uppercase" x-text="$store.hardware.doorStatus.replace(/_/g, ' ')"></h3>
+                    <h3 class="text-2xl font-black text-white tracking-tight uppercase" x-text="$store.hardware.door().label"></h3>
                     <p class="text-xs text-slate-400 mt-1 font-mono">
                         Auto-lock: <span class="text-cyan-300 font-bold">{{ $settings->auto_lock ? 'on door close (limit switch)' : 'off' }}</span>
                     </p>

@@ -52,7 +52,7 @@ Route::middleware(['auth', 'admin'])->group(function () {
     Route::put('/profile', [AuthController::class, 'updateProfile'])->name('profile.update');
 
     // User Management
-    Route::resource('users', UserController::class);
+    Route::resource('users', UserController::class)->except('show');
     Route::patch('/users/{user}/toggle-status', [UserController::class, 'toggleStatus'])->name('users.toggle-status');
 
     // ESP32 Device Registry

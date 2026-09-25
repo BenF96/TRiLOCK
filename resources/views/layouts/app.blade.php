@@ -307,14 +307,54 @@
 document.addEventListener('alpine:init', () => {
     Alpine.store('hardware', {
         doorStatus: @json($currentDoorStatus ?? ($latestDoorLog->status ?? 'locked')),
+        // False while the main controller is offline: doorStatus is then only the last
+        // thing it reported, not the door's real state.
+        doorLive: true,
         devices: [],
         lastRefreshed: null,
         interval: null,
 
         init() {
             this.poll();
-            // 20s balances "feels live" against database round-trip cost per poll.
-            this.interval = setInterval(() => this.poll(), 20000);
+            // /dashboard/status is cached server-side for 3s, so 10s polling stays cheap.
+            this.interval = setInterval(() => this.poll(), 10000);
+        },
+
+        // Display state for the door widgets: { tone, icon, label, energized }
+        door() {
+            const label = this.doorStatus.replace(/_/g, ' ').toUpperCase();
+            if (!this.doorLive) {
+                return { tone: 'offline', icon: 'fa-plug-circle-xmark', label: 'CONTROLLER OFFLINE · LAST: ' + label, energized: false };
+            }
+            switch (this.doorStatus) {
+                case 'left_open': return { tone: 'alarm', icon: 'fa-triangle-exclamation', label, energized: true };
+                case 'opened':    return { tone: 'open', icon: 'fa-door-open', label, energized: true };
+                case 'unlocked':  return { tone: 'unlocked', icon: 'fa-lock-open', label, energized: true };
+                default:          return { tone: 'secured', icon: 'fa-lock', label, energized: false };
+            }
+        },
+
+        doorToneClass(kind) {
+            const tones = {
+                badge: {
+                    offline:  'bg-slate-800 text-slate-300 border-slate-700',
+                    alarm:    'bg-rose-500/20 text-rose-300 border-rose-500/40 shadow-rose-500/20',
+                    open:     'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-amber-500/20',
+                    unlocked: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-emerald-500/20',
+                    secured:  'bg-cyan-500/10 text-cyan-300 border-cyan-500/30 shadow-cyan-500/10',
+                },
+                dot: {
+                    offline: 'bg-slate-500', alarm: 'bg-rose-400', open: 'bg-amber-400', unlocked: 'bg-emerald-400', secured: 'bg-cyan-400',
+                },
+                tile: {
+                    offline:  'bg-slate-800/60 text-slate-400 border border-slate-700',
+                    alarm:    'bg-rose-500/15 text-rose-400 border border-rose-500/40 shadow-xl shadow-rose-500/20',
+                    open:     'bg-amber-500/15 text-amber-400 border border-amber-500/40 shadow-xl shadow-amber-500/20',
+                    unlocked: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40 shadow-xl shadow-emerald-500/20',
+                    secured:  'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 shadow-xl shadow-cyan-500/10',
+                },
+            };
+            return tones[kind][this.door().tone];
         },
 
         poll() {
@@ -322,6 +362,7 @@ document.addEventListener('alpine:init', () => {
                 .then(r => r.ok ? r.json() : Promise.reject(r.status))
                 .then(data => {
                     if (data.door_status) this.doorStatus = data.door_status;
+                    if (typeof data.door_live === 'boolean') this.doorLive = data.door_live;
                     if (data.devices) this.devices = data.devices;
                     this.lastRefreshed = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 })

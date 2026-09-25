@@ -504,8 +504,13 @@ class HardwareApiController extends Controller
                 ->orderBy('created_at', 'desc')
                 ->first();
 
+            // Door state only comes from the main controller - while it's offline the latest
+            // door log is just the last thing it reported, not the door's real state.
+            $doorLive = $devices->where('type', 'esp32_main')->contains('status', 'online');
+
             return [
                 'door_status'    => $latestDoorLog ? $latestDoorLog->status : 'locked',
+                'door_live'      => $doorLive,
                 'door_updated'   => $latestDoorLog ? $latestDoorLog->updated_at : null,
                 'devices'        => $devices,
                 'last_access'    => $recentLog ? [
@@ -572,11 +577,10 @@ class HardwareApiController extends Controller
         $device = Device::find($deviceId);
         if (!$device) return null;
 
-        $data = ['status' => 'online', 'last_seen' => now()];
-        if ($ip) $data['ip_address'] = $ip;
+        if ($device->markSeen($ip)) {
+            Cache::forget('trilock_dashboard_status');
+        }
 
-        $device->update($data);
-        Cache::forget('trilock_dashboard_status');
-        return $device->fresh();
+        return $device;
     }
 }

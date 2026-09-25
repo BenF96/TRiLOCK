@@ -48,6 +48,34 @@ class Device extends Model
             && $this->last_seen->greaterThan(now()->subSeconds(self::ONLINE_THRESHOLD_SECONDS));
     }
 
+    /**
+     * Seconds within which a repeat check-in (e.g. the main controller's 3s enrollment
+     * poll) skips the database write - far below ONLINE_THRESHOLD_SECONDS, so it can't
+     * make a live device look offline.
+     */
+    public const SEEN_WRITE_INTERVAL_SECONDS = 15;
+
+    /**
+     * Record that this device just checked in. Returns true if the row was written.
+     */
+    public function markSeen(?string $ip = null): bool
+    {
+        $ipChanged = $ip !== null && $ip !== $this->ip_address;
+        $fresh = $this->status === 'online' && $this->last_seen
+            && $this->last_seen->greaterThan(now()->subSeconds(self::SEEN_WRITE_INTERVAL_SECONDS));
+
+        if ($fresh && !$ipChanged) {
+            return false;
+        }
+
+        $data = ['status' => 'online', 'last_seen' => now()];
+        if ($ip !== null) {
+            $data['ip_address'] = $ip;
+        }
+
+        return $this->update($data);
+    }
+
     public function accessLogs()
     {
         return $this->hasMany(AccessLog::class);
