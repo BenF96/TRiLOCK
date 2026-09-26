@@ -115,6 +115,7 @@ void connectWiFi();
 void maintainWiFi();
 void checkWifiResetButton();
 void checkSerialCommands();
+void runKeypadTest();
 
 // -------------------------------------------------------------------------------------
 // CONFIGURATION & PINS
@@ -231,13 +232,50 @@ const char KEYPAD_KEYS[KEYPAD_ROWS][KEYPAD_COLS] = {
 byte rowPins[KEYPAD_ROWS] = {32, 12, 14, 26}; // R1-R4
 byte colPins[KEYPAD_COLS] = {25, 33, 27};     // C1-C3
 
-Keypad keypad = Keypad(makeKeymap(KEYPAD_KEYS), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
+// The stock Keypad scan was written for 16 MHz AVRs: it reads the rows the instant a
+// column is pulled LOW, and leaves every other column floating (plain INPUT). On a
+// 240 MHz ESP32 that read lands before the lines settle, and a floating column picks up
+// the edge of its neighbour - with '#' held, pulling the '*' column LOW coupled into the
+// floating '#' column and dragged row 4 down, so '#' read as '*'; '0' flickered between
+// pressed and released on successive scans and one press typed up to 8 digits.
+// This subclass hooks the library's (virtual) pin I/O:
+//   - every column level change waits KEYPAD_SETTLE_US before the rows are read
+//   - an idle column is held HIGH by its internal pull-up instead of floating. (Not
+//     driven HIGH: two keys pressed in the same row would then short a HIGH output
+//     straight into the LOW one.)
+#define KEYPAD_SETTLE_US 30
+
+class SettledKeypad : public Keypad {
+public:
+  SettledKeypad(char* userKeymap, byte* row, byte* col, byte numRows, byte numCols)
+    : Keypad(userKeymap, row, col, numRows, numCols) {}
+
+  void pin_mode(byte pinNum, byte mode) override {
+    // The library releases a column with pin_mode(INPUT) - give it a defined level.
+    if (mode == INPUT && isColumnPin(pinNum)) mode = INPUT_PULLUP;
+    pinMode(pinNum, mode);
+  }
+
+  void pin_write(byte pinNum, boolean level) override {
+    digitalWrite(pinNum, level);
+    if (isColumnPin(pinNum)) delayMicroseconds(KEYPAD_SETTLE_US);
+  }
+
+private:
+  static bool isColumnPin(byte pinNum) {
+    for (byte c = 0; c < KEYPAD_COLS; c++) if (colPins[c] == pinNum) return true;
+    return false;
+  }
+};
+
+SettledKeypad keypad(makeKeymap(KEYPAD_KEYS), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
 
 // PIN entry state machine
 #define PIN_MAX_LEN        8     // Maximum PIN digit count
 #define PIN_ENTRY_TIMEOUT  15000 // ms: clear buffer if idle this long after first keypress
 #define MFA_SESSION_TIMEOUT 30000 // ms: time window to provide all 3 credentials (RFID + FP + PIN)
 #define KEYPAD_RESET_HOLD_MS 5000 // ms: hold '*' this long to restart the controller (tap = clear entry)
+#define KEYPAD_DEBOUNCE_MS   40   // ms: key must read stable this long (see setup())
 
 String  pinBuffer = "";           // Digits entered so far (plain text, in RAM only)
 unsigned long pinLastKeyMs = 0;   // Millis of last keypress (for timeout)
@@ -537,9 +575,48 @@ void buzzerPlayNow(const BuzzerNote* seq, uint8_t len) {
   while (bzPlaying) delay(2);
 }
 
+// KEYTEST: for 30s, prints every key the matrix scan sees and ALL keys it sees pressed
+// at that moment. A healthy keypad shows exactly one key per press, matching the label.
+// Two keys at once (e.g. "* #" when only # is pressed) = those wires are shorted; a
+// different key than pressed = that wire is on the wrong GPIO; a burst of PRESSED/
+// RELEASED from one press = a loose/bouncing contact. Bench use only - it prints the
+// actual keys, so don't run it while someone types a real PIN.
+void runKeypadTest() {
+  Serial.println("KEYTEST: press each key one at a time (30s). Layout: 1 2 3 / 4 5 6 / 7 8 9 / * 0 #");
+  unsigned long startMs = millis();
+  while (millis() - startMs < 30000) {
+    if (keypad.getKeys()) {
+      bool changed = false;
+      for (int i = 0; i < LIST_MAX; i++) {
+        if (keypad.key[i].stateChanged) {
+          changed = true;
+          const char* state = keypad.key[i].kstate == PRESSED  ? "PRESSED"
+                            : keypad.key[i].kstate == HOLD     ? "HOLD"
+                            : keypad.key[i].kstate == RELEASED ? "RELEASED" : "IDLE";
+          Serial.printf("  key '%c' %s\n", keypad.key[i].kchar, state);
+        }
+      }
+      if (changed) {
+        String down = "";
+        for (int i = 0; i < LIST_MAX; i++) {
+          if (keypad.key[i].kstate == PRESSED || keypad.key[i].kstate == HOLD) {
+            down += keypad.key[i].kchar;
+            down += ' ';
+          }
+        }
+        Serial.printf("  -> currently down: [ %s]\n", down.c_str());
+      }
+    }
+    esp_task_wdt_reset();
+    delay(5);
+  }
+  Serial.println("KEYTEST done.");
+}
+
 // Serial commands for bench checks:
 //   BUZZER_TEST - plays the unlock then the lock tone without touching the solenoid
 //   STATUS      - prints the limit switch reading, lock state and Wi-Fi
+//   KEYTEST     - 30s keypad matrix diagnostic (see runKeypadTest())
 void checkSerialCommands() {
   if (!Serial.available()) return;
   String cmd = Serial.readStringUntil('\n');
@@ -554,6 +631,8 @@ void checkSerialCommands() {
     buzzerPlay(SND_DOOR_LOCK, NOTE_COUNT(SND_DOOR_LOCK), 0, BZ_PRIO_EVENT);
     while (bzPlaying) delay(5);
     Serial.println("Buzzer test done.");
+  } else if (cmd == "KEYTEST") {
+    runKeypadTest();
   } else if (cmd == "STATUS") {
     Serial.printf("Limit switch GPIO%d raw=%d -> door %s | solenoid %s | auto-lock %s | Wi-Fi %s %s\n",
                   LIMIT_SWITCH_PIN, digitalRead(LIMIT_SWITCH_PIN), doorClosed ? "CLOSED" : "OPEN",
@@ -619,6 +698,9 @@ void setup() {
 
   // Holding '*' for KEYPAD_RESET_HOLD_MS restarts the controller (see onKeypadEvent())
   keypad.setHoldTime(KEYPAD_RESET_HOLD_MS);
+  // Library default is 10ms, shorter than a worn membrane contact's bounce - one press of
+  // '0' registered as 8 separate digits. 40ms is still far faster than anyone types.
+  keypad.setDebounceTime(KEYPAD_DEBOUNCE_MS);
   keypad.addEventListener(onKeypadEvent);
 
   // Initialize Fingerprint Sensor (UART2: RX2=GPIO17 <- sensor TX, TX2=GPIO16 -> sensor RX)
