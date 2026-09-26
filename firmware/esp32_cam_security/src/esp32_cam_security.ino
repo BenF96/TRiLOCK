@@ -255,6 +255,16 @@ void loop() {
   delay(30); // Yield; Serial polling does not need to be tight
 }
 
+// Constant-time comparison, so response timing doesn't leak how much of a guessed
+// token was correct.
+bool tokenMatches(const String &given, const char *expected) {
+  size_t expectedLen = strlen(expected);
+  if (given.length() != expectedLen) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < expectedLen; i++) diff |= (uint8_t)given[i] ^ (uint8_t)expected[i];
+  return diff == 0;
+}
+
 // -------------------------------------------------------------------------------------
 // WI-FI CAPTURE SERVER
 // Accepts "POST /capture" with a JSON body {"access_log_id": <id>} sent
@@ -281,6 +291,7 @@ void checkCaptureServer() {
   // headers split across segments used to leave Content-Length unread, so the
   // body (access_log_id) was dropped and the photo landed on an unlinked log.
   String headerLine;
+  String deviceToken = "";
   int contentLength = 0;
   unsigned long headerTimeout = millis() + 1000;
   while (client.connected() && millis() < headerTimeout) {
@@ -290,10 +301,16 @@ void checkCaptureServer() {
     }
     headerLine = client.readStringUntil('\n');
     headerLine.trim();
-    if (headerLine.startsWith("Content-Length:")) {
-      contentLength = headerLine.substring(15).toInt();
-    }
     if (headerLine.length() == 0) break; // blank line = end of headers
+
+    int colon = headerLine.indexOf(':');
+    if (colon <= 0) continue;
+    String name = headerLine.substring(0, colon);
+    String value = headerLine.substring(colon + 1);
+    name.toLowerCase();
+    value.trim();
+    if (name == "content-length") contentLength = value.toInt();
+    else if (name == "x-device-token") deviceToken = value;
   }
 
   String body = "";
@@ -304,6 +321,17 @@ void checkCaptureServer() {
 
   bool isCaptureRequest = requestLine.startsWith("POST /capture");
   String httpResponse;
+
+  // Anyone on the LAN can reach port 80 - without this, a loop of POSTs could fill the
+  // photo storage and keep the camera too busy to capture a real access attempt.
+  if (!tokenMatches(deviceToken, DEVICE_API_KEY)) {
+    Serial.println("Capture request rejected - missing/invalid X-Device-Token.");
+    client.print("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                 "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+    delay(10);
+    client.stop();
+    return;
+  }
 
   if (isCaptureRequest) {
     int accessLogId = 0;
@@ -347,6 +375,11 @@ bool captureAndUploadImage(int accessLogId) {
   // Flash LED pulse: fast 30ms pulse minimizes capture latency
   digitalWrite(FLASH_LED_PIN, HIGH);
   delay(30);
+
+  // With 2 frame buffers the driver may hand back a frame exposed BEFORE the trigger
+  // (and before the flash) - drop it so the photo shows the person actually at the door.
+  camera_fb_t *stale = esp_camera_fb_get();
+  if (stale) esp_camera_fb_return(stale);
 
   camera_fb_t *fb = esp_camera_fb_get();
   digitalWrite(FLASH_LED_PIN, LOW);

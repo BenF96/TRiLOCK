@@ -282,11 +282,24 @@ class HardwareApiController extends Controller
             'user_id'        => 'required|integer|exists:users,id',
             'card_uid'       => 'nullable|string',
             'fingerprint_id' => 'nullable|integer',
+            'occurred_at'    => 'nullable|integer',
         ]);
 
         $user = User::find($validated['user_id']);
 
         $this->touchDevice($validated['device_id']);
+
+        // When the door actually opened (device's NTP clock, Unix epoch), not when the
+        // backfill arrived - which can be hours later. Ignored if the device had no valid
+        // time yet (sends 0/omits it) or the value is implausible.
+        $occurredAt = now();
+        if (!empty($validated['occurred_at'])) {
+            $ts = \Illuminate\Support\Carbon::createFromTimestamp($validated['occurred_at'])
+                ->setTimezone(config('app.timezone'));
+            if ($ts->between(now()->subDays(30), now()->addMinutes(5))) {
+                $occurredAt = $ts;
+            }
+        }
 
         $log = AccessLog::create([
             'user_id'               => $user->id,
@@ -294,14 +307,14 @@ class HardwareApiController extends Controller
             'access_type'           => 'entry',
             'captured_image'        => null,
             'door_status'           => 'unlocked',
-            'date'                  => now()->toDateString(),
-            'time'                  => now()->toTimeString(),
+            'date'                  => $occurredAt->toDateString(),
+            'time'                  => $occurredAt->toTimeString(),
             'device_id'             => $validated['device_id'],
         ]);
 
         DoorLog::create([
             'status'    => 'unlocked',
-            'opened_at' => now(),
+            'opened_at' => $occurredAt,
             'closed_at' => null,
             'locked_at' => null,
             'remarks'   => "ESP32 API: Backfilled OFFLINE multi_factor access for {$user->full_name} " .
@@ -349,8 +362,12 @@ class HardwareApiController extends Controller
 
         if (!empty($logId)) {
             $log = AccessLog::find($logId);
-            if ($log) {
+            // Attach only to a log that has no photo yet - never overwrite the evidence
+            // already recorded against an access event.
+            if ($log && empty($log->captured_image)) {
                 $log->update(['captured_image' => $path]);
+            } else {
+                $log = null;
             }
         }
 
@@ -429,7 +446,10 @@ class HardwareApiController extends Controller
 
         // Keyed per device — a global key would let any device's heartbeat consume a
         // command meant for a different door once more than one controller is registered.
-        $pendingCmd = Cache::pull("trilock_pending_command_{$validated['device_id']}");
+        // Door commands (lock/unlock) take priority; a queued credential sync waits for
+        // the next heartbeat rather than being overwritten by (or overwriting) one.
+        $pendingCmd = Cache::pull("trilock_pending_command_{$validated['device_id']}")
+            ?? Cache::pull("trilock_pending_sync_{$validated['device_id']}");
 
         return response()->json([
             'status'                  => 'ok',
@@ -447,7 +467,8 @@ class HardwareApiController extends Controller
      * still verify a full RFID+fingerprint+PIN combo when the server is unreachable.
      * Only users with all three credentials active are included — offline mode still
      * requires all three factors, so a partial record could never match anyway.
-     * Also returns active_fingerprint_ids so ESP32 can purge deleted/unassigned templates.
+     * Also returns active_fingerprint_ids (every fingerprint ID registered in the DB,
+     * regardless of status) so the ESP32 can purge templates that were deleted.
      */
     public function offlineSync()
     {
@@ -463,10 +484,13 @@ class HardwareApiController extends Controller
             ])
             ->values();
 
-        $activeFingerprintIds = Fingerprint::where('status', 'active')
-            ->whereHas('user', fn ($q) => $q->where('status', 'active'))
-            ->pluck('fingerprint_id')
-            ->all();
+        // The ESP32 deletes every sensor template NOT in this list, so it must hold every
+        // fingerprint that still exists in the DB - disabled ones and inactive users'
+        // included. Access is gated by status (server-side and via "data" above), not by
+        // the template's presence. Excluding them used to wipe the template on disable,
+        // so re-enabling silently didn't work and the freed slot was reused by the next
+        // enrollment, whose commit then failed on the still-existing row.
+        $activeFingerprintIds = Fingerprint::pluck('fingerprint_id')->all();
 
         return response()->json([
             'status'                 => 'success',

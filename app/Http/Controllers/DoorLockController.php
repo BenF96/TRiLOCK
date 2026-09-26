@@ -164,9 +164,15 @@ class DoorLockController extends Controller
         $url = "http://{$device->ip_address}:8080/unlock";
 
         try {
-            $response = Http::timeout(2)->post($url);
+            // The ESP32 rejects this without the device token (see checkRemoteUnlockServer()).
+            $response = Http::timeout(2)
+                ->withHeaders(['X-Device-Token' => config('trilock.device_api_key')])
+                ->post($url);
 
             if ($response->successful()) {
+                // Delivered directly - drop the queued copy so the next heartbeat doesn't
+                // execute the same command a second time.
+                \Illuminate\Support\Facades\Cache::forget("trilock_pending_command_{$device->id}");
                 Log::info("ESP32 direct unlock signal sent successfully to {$url}", [
                     'device_id' => $device->id,
                 ]);
@@ -206,9 +212,15 @@ class DoorLockController extends Controller
         $url = "http://{$device->ip_address}:8080/lock";
 
         try {
-            $response = Http::timeout(2)->post($url);
+            // The ESP32 rejects this without the device token (see checkRemoteUnlockServer()).
+            $response = Http::timeout(2)
+                ->withHeaders(['X-Device-Token' => config('trilock.device_api_key')])
+                ->post($url);
 
             if ($response->successful()) {
+                // Delivered directly - drop the queued copy so the next heartbeat doesn't
+                // execute the same command a second time.
+                \Illuminate\Support\Facades\Cache::forget("trilock_pending_command_{$device->id}");
                 Log::info("ESP32 direct lock signal sent successfully to {$url}", [
                     'device_id' => $device->id,
                 ]);

@@ -97,6 +97,8 @@ class UserController extends Controller
             ]);
         }
 
+        self::notifyDevicesToSync();
+
         return redirect()->route('users.index')->with('success', "User {$user->full_name} registered successfully.");
     }
 
@@ -142,6 +144,9 @@ class UserController extends Controller
 
         $user->save();
 
+        // Status may have changed - an inactive user must drop out of the lock's offline cache
+        self::notifyDevicesToSync();
+
         return redirect()->route('users.index')->with('success', "User details updated successfully.");
     }
 
@@ -171,9 +176,15 @@ class UserController extends Controller
         try {
             $devices = Device::where('device_type', 'esp32_main')->get();
             foreach ($devices as $device) {
-                Cache::put("trilock_pending_command_{$device->id}", [
+                // Own key, separate from the lock/unlock command slot - sharing one meant a
+                // settings change right after a remote unlock silently overwrote the unlock.
+                // Deletions accumulate until the device picks them up, so two deletions
+                // between heartbeats don't lose the first one's fingerprint IDs.
+                $key = "trilock_pending_sync_{$device->id}";
+                $pending = Cache::get($key)['deleted_fingerprint_ids'] ?? [];
+                Cache::put($key, [
                     'command'                 => 'sync_offline',
-                    'deleted_fingerprint_ids' => $deletedFingerprintIds,
+                    'deleted_fingerprint_ids' => array_values(array_unique(array_merge($pending, $deletedFingerprintIds))),
                 ], 300);
             }
         } catch (\Throwable $e) {

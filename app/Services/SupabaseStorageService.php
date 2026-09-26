@@ -62,8 +62,7 @@ class SupabaseStorageService
             try {
                 $endpoint = "{$this->url}/storage/v1/object/{$bucket}/{$filename}";
 
-                $response = Http::withoutVerifying()
-                    ->withHeaders([
+                $response = Http::withHeaders([
                         'Authorization' => "Bearer {$this->serviceRoleKey}",
                         'apikey'        => $this->serviceRoleKey,
                         'Content-Type'  => $mimeType,
@@ -108,7 +107,7 @@ class SupabaseStorageService
 
         if ($this->isConfigured()) {
             try {
-                $response = Http::withoutVerifying()->withHeaders([
+                $response = Http::withHeaders([
                     'Authorization' => "Bearer {$this->serviceRoleKey}",
                     'apikey'        => $this->serviceRoleKey,
                 ])->delete("{$this->url}/storage/v1/object/{$bucket}/{$path}");

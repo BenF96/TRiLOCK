@@ -95,10 +95,20 @@ class AuthController extends Controller
             'last_name' => 'required|string|max:255',
             'email' => 'required|email|max:255|unique:users,email,' . $user->id,
             'password' => 'nullable|string|min:8|confirmed',
+            'photo' => 'nullable|image|max:2048',
+            // A hijacked session (unattended browser) must not be able to take over the
+            // admin account by changing its password or login email.
+            'current_password' => [
+                \Illuminate\Validation\Rule::requiredIf(
+                    fn () => $request->filled('password') || $request->input('email') !== $user->email
+                ),
+                'nullable',
+                'current_password',
+            ],
         ]);
 
         $user->first_name = $validated['first_name'];
-        $user->middle_name = $validated['middle_name'];
+        $user->middle_name = $validated['middle_name'] ?? null;
         $user->last_name = $validated['last_name'];
         $user->name = "{$validated['first_name']} {$validated['last_name']}";
         $user->email = $validated['email'];

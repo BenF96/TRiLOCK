@@ -410,6 +410,10 @@ class EnrollmentService
 
         $this->destroySession($token);
 
+        // Push the new user into the lock's offline cache now instead of on the next
+        // 5-minute periodic sync.
+        \App\Http\Controllers\UserController::notifyDevicesToSync();
+
         return $user->fresh(['activeRfidCard', 'activeFingerprint']);
     }
 

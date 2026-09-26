@@ -164,6 +164,9 @@ class CameraAndDoorTest extends TestCase
         $admin = User::first();
         $mainDevice = Device::where('device_type', 'esp32_main')->first();
 
+        // Direct LAN push unreachable (cloud / NAT) - the heartbeat queue is the only path
+        $this->failDirectLanPush();
+
         // 1. Admin triggers unlock on cloud portal
         $this->actingAs($admin)->post('/door/unlock', [
             'device_id' => $mainDevice->id,
@@ -192,6 +195,35 @@ class CameraAndDoorTest extends TestCase
             ]);
     }
 
+    public function test_direct_lan_unlock_sends_device_token_and_clears_queued_command()
+    {
+        $admin = User::first();
+        $mainDevice = Device::where('device_type', 'esp32_main')->first();
+        $mainDevice->update(['ip_address' => '192.168.1.50']);
+
+        $this->actingAs($admin)->post('/door/unlock', [
+            'device_id' => $mainDevice->id,
+        ]);
+
+        // The ESP32 rejects the direct push without the device token
+        \Illuminate\Support\Facades\Http::assertSent(function ($request) {
+            return $request->url() === 'http://192.168.1.50:8080/unlock'
+                && $request->hasHeader('X-Device-Token', config('trilock.device_api_key'));
+        });
+
+        // Delivered directly, so the heartbeat must not execute it a second time
+        $this->postJson('/api/heartbeat', ['device_id' => $mainDevice->id])
+            ->assertStatus(200)
+            ->assertJson(['pending_command' => null]);
+    }
+
+    private function failDirectLanPush(): void
+    {
+        \Illuminate\Support\Facades\Http::fake(function () {
+            throw new \Illuminate\Http\Client\ConnectionException('Connection refused');
+        });
+    }
+
     public function test_admin_remote_lock_action()
     {
         $admin = User::first();
@@ -209,6 +241,9 @@ class CameraAndDoorTest extends TestCase
     {
         $admin = User::first();
         $mainDevice = Device::where('device_type', 'esp32_main')->first();
+
+        // Direct LAN push unreachable (cloud / NAT) - the heartbeat queue is the only path
+        $this->failDirectLanPush();
 
         // 1. Admin triggers lock on web portal
         $this->actingAs($admin)->post('/door/lock', [

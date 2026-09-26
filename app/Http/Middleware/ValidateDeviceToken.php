@@ -35,6 +35,17 @@ class ValidateDeviceToken
         // 2. Check per-device registered token in database
         $device = Device::where('api_token', $token)->first();
         if ($device) {
+            // A per-device token only speaks for its own device. Without this, one device
+            // could post heartbeats/door events as another - e.g. pulling a remote unlock
+            // command queued for a different door.
+            $claimedId = $request->input('device_id', $request->query('device_id'));
+            if ($claimedId !== null && $claimedId !== '' && (int) $claimedId !== $device->id) {
+                return response()->json([
+                    'status'  => 'error',
+                    'message' => 'Forbidden: device token does not match device_id.',
+                ], 403);
+            }
+
             $request->attributes->set('authenticated_device', $device);
             return $next($request);
         }

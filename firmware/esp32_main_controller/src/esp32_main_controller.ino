@@ -63,6 +63,7 @@
 #include <LittleFS.h>        // On-flash cache for offline credential verification
 #include <mbedtls/md.h>      // SHA-256 for offline PIN hashing (bundled with ESP32 core)
 #include <vector>            // Offline access-event queue flush (flushOfflineQueue())
+#include <algorithm>         // std::min
 
 #define WDT_TIMEOUT_SECONDS 15
 
@@ -97,12 +98,14 @@ void sendEnrollmentResult(String type, String token, String status, String value
 void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode = "", const char* denialReason = nullptr);
 void syncOfflineCache();
 void deleteFingerprintFromSensor(int fingerprintId);
-std::vector<int> readCachedFingerprintIds(const char* path);
+std::vector<int> readCachedFingerprintIds(const char* path, bool* parsedOk = nullptr);
+bool tokenMatches(const String& given, const char* expected);
 void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<int>& newIds);
 bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int &matchedUserId);
 void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId);
 void flushOfflineQueue();
 String sha256Hex(String input);
+time_t currentEpoch();
 void fetchServerSettings();
 void sendDoorStatusUpdate(String status, String remarks);
 void sendHeartbeat();
@@ -173,6 +176,7 @@ const int DEVICE_ID       = 4; // Device ID in TRILOCK database
 // security bar for the offline path is identical to online: all three factors, matched
 // to the same user. Nothing is relaxed to single-factor.
 #define OFFLINE_CACHE_PATH        "/offline_cache.json"
+#define OFFLINE_CACHE_TMP_PATH    "/offline_cache.tmp"   // Download target, swapped in once valid
 #define OFFLINE_SYNC_INTERVAL_MS  300000  // Re-sync every 5 minutes while online
 #define OFFLINE_CACHE_DOC_SIZE    24576   // ~24KB - fits a few hundred synced users
 
@@ -188,6 +192,10 @@ const int DEVICE_ID       = 4; // Device ID in TRILOCK database
 #define OFFLINE_QUEUE_PATH         "/offline_queue.jsonl"
 #define OFFLINE_QUEUE_MAX_ENTRIES  50     // Bound flash usage if the device stays offline a long time
 #define OFFLINE_QUEUE_FLUSH_INTERVAL_MS 45000
+// Entries sent per flush tick. Each is a blocking HTTPS POST of up to a few seconds, so
+// flushing a full queue in one pass could run far past the 15s watchdog - and a reboot
+// mid-flush re-sent everything already delivered, since the file is rewritten only after.
+#define OFFLINE_QUEUE_FLUSH_BATCH  5
 
 // -------------------------------------------------------------------------------------
 // 4×3 MATRIX KEYPAD
@@ -615,6 +623,10 @@ void setup() {
   // before the task watchdog is armed below.
   pinMode(WIFI_RESET_BUTTON_PIN, INPUT_PULLUP);
   connectWiFi();
+
+  // Wall-clock time for offline access events (see currentEpoch()). SNTP runs in the
+  // background and keeps retrying, so this is safe to call even while Wi-Fi is down.
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
 
   // Fetch initial settings and offline credential cache from TRILOCK Server
   fetchServerSettings();
@@ -1053,7 +1065,7 @@ void checkKeypad() {
     // Stage PIN into MFA session
     if (pinBuffer.length() >= 4) {
       currentMfaPin = pinBuffer;
-      Serial.printf("[Factor 3/3] Keypad PIN Captured: %s\n", currentMfaPin.c_str());
+      Serial.printf("[Factor 3/3] Keypad PIN Captured (%d digits)\n", currentMfaPin.length()); // never log the PIN itself
       printMfaStatus();
       checkMfaCompletion();
     } else {
@@ -1133,7 +1145,7 @@ void enrollPinOnKeypad(String sessionToken) {
       buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
       if (key == '#') {
         if (enrolledPin.length() >= 4 && enrolledPin.length() <= 8) {
-          Serial.printf("Keypad PIN Captured: %s\n", enrolledPin.c_str());
+          Serial.printf("Keypad PIN Captured for enrollment (%d digits)\n", enrolledPin.length());
           buzzerPlayNow(SND_GRANTED, NOTE_COUNT(SND_GRANTED));
           sendEnrollmentResult("pin", sessionToken, "success", enrolledPin, 0);
           return;
@@ -1165,6 +1177,7 @@ void enrollFingerprintOnSensor(String sessionToken) {
   int id = 1;
   while (id <= 127 && finger.loadModel(id) == FINGERPRINT_OK) {
     id++;
+    esp_task_wdt_reset(); // up to 127 sensor round-trips
   }
   if (id > 127) {
     sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Sensor full (127 slots).");
@@ -1364,8 +1377,18 @@ void checkDoorAjar() {
 // REMOTE UNLOCK BACK-CHANNEL (inbound HTTP from Laravel server)
 // -------------------------------------------------------------------------------------
 // Laravel POSTs to http://<ESP32_IP>:8080/unlock to physically fire the solenoid.
-// The server reads the request line, extracts the unlock duration from the JSON body,
-// fires the solenoid, and responds with a short JSON ack.
+// The request must carry X-Device-Token: DEVICE_API_KEY, otherwise it gets a 401.
+
+// Constant-time comparison, so response timing doesn't leak how much of a guessed
+// token was correct.
+bool tokenMatches(const String& given, const char* expected) {
+  size_t expectedLen = strlen(expected);
+  if (given.length() != expectedLen) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < expectedLen; i++) diff |= (uint8_t)given[i] ^ (uint8_t)expected[i];
+  return diff == 0;
+}
+
 void checkRemoteUnlockServer() {
   WiFiClient client = unlockServer.available();
   if (!client) return;
@@ -1384,16 +1407,29 @@ void checkRemoteUnlockServer() {
   Serial.print("Remote unlock request: ");
   Serial.println(requestLine);
 
-  // Skip through headers until we reach the blank line before the body
+  // Wait for headers instead of stopping at the first lull in the TCP stream - headers
+  // split across segments used to be cut short, dropping everything after the split.
   String headerLine;
+  String deviceToken = "";
   int contentLength = 0;
-  while (client.available()) {
+  unsigned long headerTimeout = millis() + 1000;
+  while (client.connected() && millis() < headerTimeout) {
+    if (!client.available()) {
+      delay(1);
+      continue;
+    }
     headerLine = client.readStringUntil('\n');
     headerLine.trim();
-    if (headerLine.startsWith("Content-Length:")) {
-      contentLength = headerLine.substring(16).toInt();
-    }
     if (headerLine.length() == 0) break; // blank line = end of headers
+
+    int colon = headerLine.indexOf(':');
+    if (colon <= 0) continue;
+    String name = headerLine.substring(0, colon);
+    String value = headerLine.substring(colon + 1);
+    name.toLowerCase();
+    value.trim();
+    if (name == "content-length") contentLength = value.toInt();
+    else if (name == "x-device-token") deviceToken = value;
   }
 
   // Read JSON body
@@ -1403,10 +1439,20 @@ void checkRemoteUnlockServer() {
     if (client.available()) body += (char)client.read();
   }
 
-
   bool isUnlockRequest = requestLine.startsWith("POST /unlock");
   bool isLockRequest   = requestLine.startsWith("POST /lock");
   String httpResponse;
+
+  // Anyone on the LAN can reach this port - only the server, which holds the device
+  // key, may fire the solenoid.
+  if (!tokenMatches(deviceToken, DEVICE_API_KEY)) {
+    Serial.println("Remote request rejected - missing/invalid X-Device-Token.");
+    client.print("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                 "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+    delay(10);
+    client.stop();
+    return;
+  }
 
   if (isUnlockRequest) {
     unlockDoor();
@@ -1447,6 +1493,7 @@ void triggerCameraCapture(String cameraIp, int accessLogId) {
   http.begin(url);
   http.setTimeout(CAMERA_CAPTURE_HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Token", DEVICE_API_KEY); // the CAM rejects unauthenticated triggers
 
   String payload = "{\"access_log_id\":" + String(accessLogId) + "}";
   int httpCode = http.POST(payload);
@@ -1490,6 +1537,21 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     httpResponseCode = http.POST(jsonPayload);
     if (httpResponseCode > 0) response = http.getString();
     http.end();
+
+    // 5xx (e.g. Render's 502/503 while the instance spins up), a throttle 429 and 408 are
+    // "server can't answer right now", not a verdict - treat them like no response at all
+    // so the offline cache gets a chance, instead of denying a legitimate user. But the
+    // brute-force lockout is ALSO a 429, carrying {"status":"locked_out"}: anything with a
+    // "status" field is a real decision and must be honoured, or the offline path would
+    // bypass the lockout.
+    if (httpResponseCode >= 500 || httpResponseCode == 429 || httpResponseCode == 408) {
+      JsonDocument probe;
+      bool isVerdict = !deserializeJson(probe, response) && probe["status"].is<const char*>();
+      if (!isVerdict) {
+        Serial.printf("Server unavailable (HTTP %d) - treating as unreachable.\n", httpResponseCode);
+        httpResponseCode = -1;
+      }
+    }
   }
 
   if (httpResponseCode > 0) {
@@ -1584,22 +1646,55 @@ void syncOfflineCache() {
   http.addHeader("Accept", "application/json");
 
   int code = http.GET();
-  if (code == 200) {
-    File f = LittleFS.open(OFFLINE_CACHE_PATH, "w");
-    if (f) {
-      http.writeToStream(&f);
-      f.close();
-      Serial.println("Offline credential cache synced to flash.");
-
-      std::vector<int> newFingerprintIds = readCachedFingerprintIds(OFFLINE_CACHE_PATH);
-      purgeRevokedFingerprints(oldFingerprintIds, newFingerprintIds);
-    } else {
-      Serial.println("Failed to open offline cache file for writing.");
-    }
-  } else {
+  if (code != 200) {
     Serial.printf("Offline cache sync failed (HTTP %d), keeping previous cache.\n", code);
+    http.end();
+    return;
   }
+
+  // Download into a temp file and only swap it in once it parses. Writing straight over
+  // the live cache meant a download cut short (timeout, Wi-Fi drop) left a corrupt cache,
+  // which broke offline unlock AND made the purge below see an empty active list and
+  // delete every template on the sensor.
+  File f = LittleFS.open(OFFLINE_CACHE_TMP_PATH, "w");
+  if (!f) {
+    Serial.println("Failed to open offline cache temp file for writing.");
+    http.end();
+    return;
+  }
+  int written = http.writeToStream(&f);
+  f.close();
   http.end();
+  esp_task_wdt_reset();
+
+  bool parsedOk = false;
+  std::vector<int> newFingerprintIds;
+  if (written > 0) newFingerprintIds = readCachedFingerprintIds(OFFLINE_CACHE_TMP_PATH, &parsedOk);
+  if (!parsedOk) {
+    Serial.printf("Offline cache download incomplete/invalid (%d bytes), keeping previous cache.\n", written);
+    LittleFS.remove(OFFLINE_CACHE_TMP_PATH);
+    return;
+  }
+
+  if (!LittleFS.rename(OFFLINE_CACHE_TMP_PATH, OFFLINE_CACHE_PATH)) {
+    // Some FS versions won't rename over an existing file
+    LittleFS.remove(OFFLINE_CACHE_PATH);
+    if (!LittleFS.rename(OFFLINE_CACHE_TMP_PATH, OFFLINE_CACHE_PATH)) {
+      Serial.println("Failed to replace offline cache file, keeping previous cache.");
+      LittleFS.remove(OFFLINE_CACHE_TMP_PATH);
+      return;
+    }
+  }
+  Serial.println("Offline credential cache synced to flash.");
+
+  // An empty active list is far more likely a server-side glitch than every user being
+  // revoked at once - never let it wipe the sensor. Individual deletions still arrive
+  // via the heartbeat's deleted_fingerprint_ids.
+  if (newFingerprintIds.empty()) {
+    Serial.println("Server reported no active fingerprints - skipping sensor purge as a safety measure.");
+    return;
+  }
+  purgeRevokedFingerprints(oldFingerprintIds, newFingerprintIds);
 }
 
 // Deletes a specific fingerprint template model from the AS608 optical sensor flash memory
@@ -1613,9 +1708,12 @@ void deleteFingerprintFromSensor(int fingerprintId) {
   }
 }
 
-// Reads both "active_fingerprint_ids" (all valid system fingerprints) and "data" entries out of offline-sync JSON
-std::vector<int> readCachedFingerprintIds(const char* path) {
+// Reads both "active_fingerprint_ids" (all valid system fingerprints) and "data" entries out of offline-sync JSON.
+// parsedOk (optional) is set true only if the file parsed and has the expected shape - an
+// empty result alone can't tell "no fingerprints" apart from "unreadable file".
+std::vector<int> readCachedFingerprintIds(const char* path, bool* parsedOk) {
   std::vector<int> ids;
+  if (parsedOk) *parsedOk = false;
   if (!LittleFS.exists(path)) return ids;
 
   File f = LittleFS.open(path, "r");
@@ -1624,7 +1722,8 @@ std::vector<int> readCachedFingerprintIds(const char* path) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, f);
   f.close();
-  if (err) return ids;
+  if (err || !doc["data"].is<JsonArray>()) return ids;
+  if (parsedOk) *parsedOk = true;
 
   if (doc["active_fingerprint_ids"].is<JsonArray>()) {
     JsonArray activeIds = doc["active_fingerprint_ids"].as<JsonArray>();
@@ -1672,6 +1771,7 @@ void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<
 
   // 2. Hardware scan: check sensor slots (1 to 127). If a slot is loaded but not in activeServerIds, delete it.
   for (int slot = 1; slot <= 127; slot++) {
+    esp_task_wdt_reset(); // 127 sensor round-trips can add up to several seconds
     bool isActive = false;
     for (int n : activeServerIds) {
       if (n == slot) { isActive = true; break; }
@@ -1762,6 +1862,9 @@ void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
   doc["user_id"] = userId;
   doc["card_uid"] = cardUid;
   doc["fingerprint_id"] = fingerprintId;
+  // When the door actually opened - otherwise the dashboard shows the time the event
+  // was backfilled, which can be hours later. 0 if NTP hasn't synced since boot.
+  doc["occurred_at"] = (long)currentEpoch();
   serializeJson(doc, f);
   f.println();
   f.close();
@@ -1795,12 +1898,15 @@ void flushOfflineQueue() {
   }
 
   size_t sentCount = 0;
-  for (; sentCount < lines.size(); sentCount++) {
+  size_t batchEnd = std::min(lines.size(), (size_t)OFFLINE_QUEUE_FLUSH_BATCH);
+  for (; sentCount < batchEnd; sentCount++) {
+    esp_task_wdt_reset();
     JsonDocument doc;
     if (deserializeJson(doc, lines[sentCount])) continue; // corrupt line - skip, don't block the rest
 
     HTTPClient http;
     http.begin(String(SERVER_URL) + "/api/access/offline-log");
+    http.setConnectTimeout(BACKGROUND_HTTP_TIMEOUT_MS);
     http.setTimeout(BACKGROUND_HTTP_TIMEOUT_MS);
     http.addHeader("X-Device-Token", DEVICE_API_KEY);
     http.addHeader("Accept", "application/json");
@@ -1811,6 +1917,8 @@ void flushOfflineQueue() {
     payload["user_id"] = doc["user_id"] | 0;
     payload["card_uid"] = doc["card_uid"] | "";
     payload["fingerprint_id"] = doc["fingerprint_id"] | 0;
+    long occurredAt = doc["occurred_at"] | 0L;
+    if (occurredAt > 0) payload["occurred_at"] = occurredAt;
 
     String jsonPayload;
     serializeJson(payload, jsonPayload);
@@ -1849,6 +1957,12 @@ void flushOfflineQueue() {
   Serial.printf("Offline access queue: synced %u, %u still pending.\n", (unsigned)sentCount, (unsigned)(lines.size() - sentCount));
 }
 
+// Unix time from SNTP, or 0 if the clock hasn't been set since boot (it starts at 1970).
+time_t currentEpoch() {
+  time_t now = time(nullptr);
+  return now > 1700000000 ? now : 0; // anything before Nov 2023 = not synced yet
+}
+
 // SHA-256 of `input`, lowercase hex - must match Laravel's hash('sha256', $pin.$salt).
 String sha256Hex(String input) {
   unsigned char hash[32];
@@ -1883,7 +1997,13 @@ void fetchServerSettings() {
   if (httpResponseCode == 200) {
     String response = http.getString();
     JsonDocument doc;
-    deserializeJson(doc, response);
+    // An unparseable 200 (e.g. a proxy's HTML error page) would otherwise read every
+    // field as missing and silently reset all settings to their "| true" defaults.
+    if (deserializeJson(doc, response) || !doc["data"].is<JsonObject>()) {
+      Serial.println("Settings response unreadable, keeping previous values.");
+      http.end();
+      return;
+    }
 
     bool buzzerEnabled = doc["data"]["buzzer_enabled"] | true;
     buzzerSetMuted(!buzzerEnabled);
