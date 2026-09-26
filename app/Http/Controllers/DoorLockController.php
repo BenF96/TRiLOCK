@@ -10,6 +10,7 @@ use App\Models\Device;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use App\Support\DoorState;
 
 class DoorLockController extends Controller
 {
@@ -65,8 +66,8 @@ class DoorLockController extends Controller
             'closed_at' => null,
             'locked_at' => null,
             'remarks'   => $device
-                ? "Remote Manual Unlock by Admin {$user->name} ({$device->device_name})"
-                : "Remote Manual Unlock by Admin {$user->name}",
+                ? "Remote unlock requested by Admin {$user->name} ({$device->device_name})"
+                : "Remote unlock requested by Admin {$user->name}",
         ]);
 
         AccessLog::create([
@@ -84,8 +85,12 @@ class DoorLockController extends Controller
         // The ESP32 main controller runs a tiny HTTP server on port 8080.
         $signalResult = $this->signalEsp32Unlock($device);
 
-        if ($signalResult['success']) {
+        if ($signalResult['success'] && empty($signalResult['queued'])) {
             return back()->with('success', 'Door unlocked remotely. It relocks automatically once the door is opened and closed again.');
+        }
+        if ($signalResult['success']) {
+            // Not confirmed yet - the lock picks it up on its next check-in
+            return back()->with('success', 'Unlock sent. The lock picks it up on its next check-in (within ~30s); the status updates when it does.');
         }
 
         // Still logged — but warn the admin the hardware may not have responded
@@ -118,14 +123,17 @@ class DoorLockController extends Controller
             'closed_at' => null,
             'locked_at' => now(),
             'remarks'   => $device
-                ? "Remote Manual Lock by Admin {$user->name} ({$device->device_name})"
-                : "Remote Manual Lock by Admin {$user->name}",
+                ? "Remote lock requested by Admin {$user->name} ({$device->device_name})"
+                : "Remote lock requested by Admin {$user->name}",
         ]);
 
         $signalResult = $this->signalEsp32Lock($device);
 
-        if ($signalResult['success']) {
+        if ($signalResult['success'] && empty($signalResult['queued'])) {
             return back()->with('success', 'Door locked remotely.');
+        }
+        if ($signalResult['success']) {
+            return back()->with('success', 'Lock sent. The lock picks it up on its next check-in (within ~30s); the status updates when it does.');
         }
 
         return back()->with('warning', "Lock logged, but could not reach the ESP32 hardware: {$signalResult['error']}. Verify the device is online.");
@@ -173,6 +181,7 @@ class DoorLockController extends Controller
                 // Delivered directly - drop the queued copy so the next heartbeat doesn't
                 // execute the same command a second time.
                 \Illuminate\Support\Facades\Cache::forget("trilock_pending_command_{$device->id}");
+                DoorState::markUnlocked($device->id); // the lock confirmed it
                 Log::info("ESP32 direct unlock signal sent successfully to {$url}", [
                     'device_id' => $device->id,
                 ]);
@@ -221,6 +230,7 @@ class DoorLockController extends Controller
                 // Delivered directly - drop the queued copy so the next heartbeat doesn't
                 // execute the same command a second time.
                 \Illuminate\Support\Facades\Cache::forget("trilock_pending_command_{$device->id}");
+                DoorState::markLocked($device->id); // the lock confirmed it
                 Log::info("ESP32 direct lock signal sent successfully to {$url}", [
                     'device_id' => $device->id,
                 ]);

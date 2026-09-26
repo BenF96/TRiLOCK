@@ -25,8 +25,8 @@ class DashboardController extends Controller
             ->count();
         $todayScans = AccessLog::whereDate('date', $today)->count();
 
-        $latestDoorLog = DoorLog::latest()->first();
-        $currentDoorStatus = $latestDoorLog ? $latestDoorLog->status : 'locked';
+        $latestDoorLog = DoorLog::latest('id')->first();
+        $currentDoorStatus = \App\Support\DoorState::current();
 
         $devicesCount = Device::count();
         // Computed via isOnline() (last_seen vs. threshold), not the `status` column —

@@ -110,6 +110,7 @@ String sha256Hex(String input);
 time_t currentEpoch();
 void fetchServerSettings();
 void sendDoorStatusUpdate(String status, String remarks);
+void addDoorSnapshot(JsonDocument& doc);
 void sendHeartbeat();
 void connectWiFi();
 void maintainWiFi();
@@ -1511,8 +1512,12 @@ void checkDoorSensor() {
   if (!doorClosed) {
     doorOpenedAt = millis();
     if (isDoorUnlocked) doorOpenedSinceUnlock = true;
-    Serial.println("Door State: OPENED");
-    sendDoorStatusUpdate("opened", "Door limit switch released - door opened");
+    Serial.println(isDoorUnlocked ? "Door State: OPENED" : "Door State: OPENED while lock engaged");
+    // Opened with the solenoid NOT energized = someone left from inside (handle / exit),
+    // a mechanical override, or a forced entry. Worth telling apart in the history.
+    sendDoorStatusUpdate("opened", isDoorUnlocked
+      ? "Door limit switch released - door opened"
+      : "Door opened while the lock was engaged (exit from inside, override, or forced)");
   } else {
     doorOpenedAt = 0;
     if (doorAjarAlarmActive) {
@@ -2228,6 +2233,14 @@ void fetchServerSettings() {
   http.end();
 }
 
+// The lock's actual state, sent with every door event and heartbeat - the server shows
+// this as the live door status (door_logs is only the history).
+void addDoorSnapshot(JsonDocument& doc) {
+  doc["door_closed"] = doorClosed;
+  doc["lock"]        = isDoorUnlocked ? "unlocked" : "locked";
+  doc["ajar_alarm"]  = doorAjarAlarmActive;
+}
+
 void sendDoorStatusUpdate(String status, String remarks) {
   // 'opened'/'closed' come from the door limit switch (checkDoorSensor()),
   // 'left_open' from the ajar alarm (checkDoorAjar()), 'locked' from the solenoid
@@ -2249,6 +2262,7 @@ void sendDoorStatusUpdate(String status, String remarks) {
   doc["status"]    = status;
   doc["remarks"]   = remarks;
   doc["device_id"] = DEVICE_ID;
+  addDoorSnapshot(doc);
 
   String jsonPayload;
   serializeJson(doc, jsonPayload);
@@ -2277,6 +2291,9 @@ void sendHeartbeat() {
   JsonDocument doc;
   doc["device_id"] = DEVICE_ID;
   doc["ip_address"] = WiFi.localIP().toString();
+  // Every 30s: the server's live door status self-corrects even if a door event was
+  // lost (sendDoorStatusUpdate() drops events while Wi-Fi is down).
+  addDoorSnapshot(doc);
 
   String jsonPayload;
   serializeJson(doc, jsonPayload);

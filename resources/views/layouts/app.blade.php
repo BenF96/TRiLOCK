@@ -306,7 +306,7 @@
 // /dashboard/status endpoint at once.
 document.addEventListener('alpine:init', () => {
     Alpine.store('hardware', {
-        doorStatus: @json($currentDoorStatus ?? ($latestDoorLog->status ?? 'locked')),
+        doorStatus: @json($currentDoorStatus ?? \App\Support\DoorState::current()),
         // False while the main controller is offline: doorStatus is then only the last
         // thing it reported, not the door's real state.
         doorLive: true,

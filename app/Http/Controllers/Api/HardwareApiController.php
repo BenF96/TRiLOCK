@@ -17,6 +17,7 @@ use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use App\Services\SupabaseStorageService;
+use App\Support\DoorState;
 
 class HardwareApiController extends Controller
 {
@@ -191,6 +192,9 @@ class HardwareApiController extends Controller
 
             // Clear failed attempts counter upon successful authorized access
             Cache::forget($failKey);
+
+            // The lock unlocks on this 'granted' - reflect it before its next report
+            DoorState::markUnlocked($deviceId);
 
             // Create an unlocked door log; the actual close/lock timestamps will be
             // updated by door-status events (via /api/door-status), not guessed.
@@ -443,12 +447,17 @@ class HardwareApiController extends Controller
             'status'    => 'required|string|in:opened,closed,locked,left_open',
             'remarks'   => 'nullable|string',
             'device_id' => 'nullable|integer',
+            ...self::DOOR_SNAPSHOT_RULES,
         ]);
 
         // Update device heartbeat on every sensor event
         $deviceId = $validated['device_id'] ?? null;
         if ($deviceId) {
             $this->touchDevice($deviceId);
+
+            // Live state: apply the event, then the device's full snapshot if it sent one
+            DoorState::applyEvent($deviceId, $validated['status']);
+            $this->recordDoorSnapshot($deviceId, $validated);
         }
 
         $doorLog = DoorLog::create([
@@ -475,9 +484,13 @@ class HardwareApiController extends Controller
         $validated = $request->validate([
             'device_id'  => 'required|integer',
             'ip_address' => 'nullable|string|max:45',
+            ...self::DOOR_SNAPSHOT_RULES,
         ]);
 
         $device = $this->touchDevice($validated['device_id'], $validated['ip_address'] ?? null);
+
+        // Periodic snapshot - corrects anything a lost door event left wrong
+        $this->recordDoorSnapshot($validated['device_id'], $validated);
 
         // Keyed per device — a global key would let any device's heartbeat consume a
         // command meant for a different door once more than one controller is registered.
@@ -485,6 +498,13 @@ class HardwareApiController extends Controller
         // the next heartbeat rather than being overwritten by (or overwriting) one.
         $pendingCmd = Cache::pull("trilock_pending_command_{$validated['device_id']}")
             ?? Cache::pull("trilock_pending_sync_{$validated['device_id']}");
+
+        // Handing over a door command - show its effect now, not on the next heartbeat
+        match ($pendingCmd['command'] ?? null) {
+            'unlock' => DoorState::markUnlocked($validated['device_id']),
+            'lock'   => DoorState::markLocked($validated['device_id']),
+            default  => null,
+        };
 
         return response()->json([
             'status'                  => 'ok',
@@ -543,7 +563,7 @@ class HardwareApiController extends Controller
     public function getStatus()
     {
         $data = Cache::remember('trilock_dashboard_status', 3, function () {
-            $latestDoorLog = DoorLog::latest()->first();
+            $latestDoorLog = DoorLog::latest('id')->first();
             $devices = Device::select('id', 'device_name', 'device_type', 'ip_address', 'status', 'last_seen')
                 ->get()
                 ->map(function ($device) {
@@ -568,7 +588,7 @@ class HardwareApiController extends Controller
             $doorLive = $devices->where('type', 'esp32_main')->contains('status', 'online');
 
             return [
-                'door_status'    => $latestDoorLog ? $latestDoorLog->status : 'locked',
+                'door_status'    => DoorState::current(),
                 'door_live'      => $doorLive,
                 'door_updated'   => $latestDoorLog ? $latestDoorLog->updated_at : null,
                 'devices'        => $devices,
@@ -588,6 +608,28 @@ class HardwareApiController extends Controller
     // -------------------------------------------------------------------------------------
     // Internal Helpers
     // -------------------------------------------------------------------------------------
+
+    /**
+     * Live door snapshot the main controller sends with door events and heartbeats
+     * (see App\Support\DoorState). All optional - older firmware omits them.
+     */
+    private const DOOR_SNAPSHOT_RULES = [
+        'door_closed' => 'nullable|boolean',
+        'lock'        => 'nullable|string|in:locked,unlocked',
+        'ajar_alarm'  => 'nullable|boolean',
+    ];
+
+    private function recordDoorSnapshot(int $deviceId, array $validated): void
+    {
+        $snapshot = array_filter(
+            array_intersect_key($validated, self::DOOR_SNAPSHOT_RULES),
+            fn ($v) => $v !== null
+        );
+
+        if ($snapshot && Device::whereKey($deviceId)->exists()) {
+            DoorState::record($deviceId, $snapshot);
+        }
+    }
 
     /**
      * Record a rejected attempt as a 'denied' access log. Also invalidates the cached
