@@ -81,6 +81,7 @@ bool readRfidCard(String &cardUidOut);
 void checkRfidCard();
 void checkFingerprint();
 void checkKeypad();
+void onKeypadEvent(char key);
 void checkMfaCompletion();
 void resetMfaSession();
 void printMfaStatus();
@@ -115,13 +116,18 @@ void checkSerialCommands();
 // -------------------------------------------------------------------------------------
 // Wi-Fi credentials are NOT compiled in - they're entered through the WiFiManager
 // captive portal and persisted in NVS by the ESP32 core (see connectWiFi()). On first
-// boot, or whenever the saved network can't be reached at boot, the device opens a
-// "TRILOCK-Lock-XXXX" access point: join it, and the setup page opens automatically
-// (or browse to 192.168.4.1). Hold the BOOT button (GPIO0) for WIFI_RESET_HOLD_MS to
-// forget the saved network and reopen the portal.
+// boot (no saved network) the device opens a "TRILOCK-Lock-XXXX" access point: join it,
+// and the setup page opens automatically (or browse to 192.168.4.1). If a network IS
+// saved but unreachable at boot, the same AP is opened for WIFI_PORTAL_TIMEOUT_S so the
+// network can be changed on site, then the device keeps retrying the saved network in
+// the background. The portal is non-blocking (serviced from loop()), so the door keeps
+// working from the local credential cache the whole time. Hold the BOOT button (GPIO0)
+// for WIFI_RESET_HOLD_MS to forget the saved network and reopen the portal.
+// Note: the ESP32 radio is 2.4 GHz only - 5 GHz-only networks never show in the scan.
 const char* WIFI_PORTAL_PASSWORD = "trilock-setup"; // Setup AP password (min 8 chars)
-#define WIFI_PORTAL_TIMEOUT_S    180   // Give up on the portal and boot offline after this
+#define WIFI_PORTAL_TIMEOUT_S    180   // Close the portal after this if a network is saved
 #define WIFI_CONNECT_TIMEOUT_S   15    // Per-attempt timeout for the saved network at boot
+#define WIFI_SAVE_CONNECT_TIMEOUT_S 10 // Portal "Save" connect runs inside loop() - keep under the 15s WDT
 #define WIFI_RETRY_INTERVAL_MS   10000 // Background reconnect cadence once running
 #define WIFI_RESET_BUTTON_PIN    0     // On-board BOOT button (active LOW)
 #define WIFI_RESET_HOLD_MS       5000
@@ -220,6 +226,7 @@ Keypad keypad = Keypad(makeKeymap(KEYPAD_KEYS), rowPins, colPins, KEYPAD_ROWS, K
 #define PIN_MAX_LEN        8     // Maximum PIN digit count
 #define PIN_ENTRY_TIMEOUT  15000 // ms: clear buffer if idle this long after first keypress
 #define MFA_SESSION_TIMEOUT 30000 // ms: time window to provide all 3 credentials (RFID + FP + PIN)
+#define KEYPAD_RESET_HOLD_MS 5000 // ms: hold '*' this long to restart the controller (tap = clear entry)
 
 String  pinBuffer = "";           // Digits entered so far (plain text, in RAM only)
 unsigned long pinLastKeyMs = 0;   // Millis of last keypress (for timeout)
@@ -280,9 +287,10 @@ bool keyBlinkActive = false;
 #define BUZZER_IS_ACTIVE     0     // 0 = passive piezo (PWM tones), 1 = active buzzer (on/off)
 #define BUZZER_LEDC_CHANNEL  0     // LEDC channel reserved for the buzzer (ESP32 core 2.x)
 #define BUZZER_LEDC_BITS     8     // PWM resolution
-// 1 = the buzzer only sounds the credential-scan chirp, the 1s unlock / 1s lock tones
-// and the continuous door-left-open alarm; every other sound (denied, boot, Wi-Fi) is
-// silenced. Set 0 to restore them.
+// 1 = the buzzer only sounds the credential-scan chirp, the access-denied beeps, the
+// '*' clear / restart tones, the 1s unlock / 1s lock tones and the continuous
+// door-left-open alarm; every other sound (keypad errors, boot, Wi-Fi) is silenced.
+// Set 0 to restore them.
 #define BUZZER_DOOR_EVENTS_ONLY 1
 #define DOOR_AJAR_ALARM_MS   15000 // Sound the alarm if the door stays open this long
 #define DOOR_DEBOUNCE_MS     80    // Limit switch debounce window (lever bounce on impact)
@@ -298,6 +306,7 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 
 // Inbound HTTP server for remote unlock back-channel from Laravel
 WiFiServer unlockServer(UNLOCK_SERVER_PORT);
+WiFiManager wm; // Global so the non-blocking setup portal can be serviced from loop()
 
 // Global Variables & Timers
 bool doorClosed = true;             // Debounced limit switch state
@@ -373,6 +382,9 @@ static const BuzzerNote SND_REMOTE[]    = {{1800, 80}, {0, 40}, {2200, 80}, {0, 
 static const BuzzerNote SND_DOOR_UNLOCK[] = {{2000, 1000}}; // single continuous 1s tone on unlock
 static const BuzzerNote SND_DOOR_LOCK[]   = {{1400, 1000}}; // single continuous 1s tone on lock
 static const BuzzerNote SND_AJAR[]        = {{2800, 1000}}; // looped = continuous tone until the door closes
+static const BuzzerNote SND_ACCESS_DENIED[] = {{400, 250}, {0, 100}, {400, 250}, {0, 100}, {400, 250}}; // 3 low beeps
+static const BuzzerNote SND_CLEARED[]  = {{1200, 70}, {0, 60}, {1200, 70}};                    // '*' tap - entry cleared
+static const BuzzerNote SND_RESTART[]  = {{1600, 150}, {0, 60}, {1200, 150}, {0, 60}, {800, 300}}; // '*' held - rebooting
 
 // Sequencer state - shared between loop() and the buzzer task, guarded by bzMutex.
 static const BuzzerNote* bzSeq = nullptr;
@@ -442,7 +454,8 @@ void buzzerStop() {
 bool buzzerPlay(const BuzzerNote* seq, uint8_t len, int16_t repeats, uint8_t priority) {
   if (len == 0) return false;
 #if BUZZER_DOOR_EVENTS_ONLY
-  if (seq != SND_SCAN && seq != SND_DOOR_UNLOCK && seq != SND_DOOR_LOCK && seq != SND_AJAR) return false;
+  if (seq != SND_SCAN && seq != SND_DOOR_UNLOCK && seq != SND_DOOR_LOCK && seq != SND_AJAR &&
+      seq != SND_ACCESS_DENIED && seq != SND_CLEARED && seq != SND_RESTART) return false;
 #endif
 
   xSemaphoreTake(bzMutex, portMAX_DELAY);
@@ -575,6 +588,10 @@ void setup() {
     Serial.printf("MFRC522 RFID Reader Initialized (VersionReg=0x%02X, Gain=Max).\n", rfidVersion);
   }
 
+  // Holding '*' for KEYPAD_RESET_HOLD_MS restarts the controller (see onKeypadEvent())
+  keypad.setHoldTime(KEYPAD_RESET_HOLD_MS);
+  keypad.addEventListener(onKeypadEvent);
+
   // Initialize Fingerprint Sensor (UART2: RX2=GPIO17 <- sensor TX, TX2=GPIO16 -> sensor RX)
   mySerial.begin(57600, SERIAL_8N1, 17, 16);
   finger.begin(57600);
@@ -593,9 +610,9 @@ void setup() {
   // is deliberately done once at boot rather than on every flushOfflineQueue() tick).
   offlineQueuePending = LittleFS.exists(OFFLINE_QUEUE_PATH);
 
-  // Connect to Wi-Fi Network (opens the setup portal if no saved network is reachable).
-  // Runs before the task watchdog is armed below, since the portal blocks for up to
-  // WIFI_PORTAL_TIMEOUT_S.
+  // Connect to Wi-Fi Network (opens the non-blocking setup portal if the connect fails).
+  // The saved-network connect blocks for up to WIFI_CONNECT_TIMEOUT_S, so this runs
+  // before the task watchdog is armed below.
   pinMode(WIFI_RESET_BUTTON_PIN, INPUT_PULLUP);
   connectWiFi();
 
@@ -777,7 +794,7 @@ void denyAccess() {
   ledRedActive = true;
 
   // Beep Error
-  buzzerPlay(SND_DENIED, NOTE_COUNT(SND_DENIED), 0, BZ_PRIO_EVENT);
+  buzzerPlay(SND_ACCESS_DENIED, NOTE_COUNT(SND_ACCESS_DENIED), 0, BZ_PRIO_EVENT);
 
   // A denied attempt ends the attempt - drop any credentials still staged so the next
   // person starts from a clean 0/3 instead of inheriting half of this session.
@@ -803,7 +820,7 @@ bool rejectIfLockedOut() {
 
   if (millis() - lastLockoutToneMs >= LOCKOUT_REJECT_TONE_GAP_MS) {
     lastLockoutToneMs = millis();
-    buzzerPlay(SND_DENIED, NOTE_COUNT(SND_DENIED), 0, BZ_PRIO_EVENT);
+    buzzerPlay(SND_ACCESS_DENIED, NOTE_COUNT(SND_ACCESS_DENIED), 0, BZ_PRIO_EVENT);
     Serial.printf("Input rejected - security lockout active (%lu s left)\n",
       (lockoutUntilMs - millis()) / 1000UL);
   }
@@ -989,6 +1006,19 @@ void checkFingerprint() {
 // -------------------------------------------------------------------------------------
 // 4x3 MATRIX KEYPAD SCANNING (PIN Access & Enrollment)
 // -------------------------------------------------------------------------------------
+// Keypad state-change callback, fired from inside keypad.getKey() (so it also works
+// during enrollPinOnKeypad()). A tap on '*' is handled by checkKeypad() as "clear entry";
+// holding it past KEYPAD_RESET_HOLD_MS reaches HOLD here and reboots the controller.
+void onKeypadEvent(char key) {
+  if (key != '*' || keypad.getState() != HOLD) return;
+
+  Serial.println("* held - restarting controller...");
+  digitalWrite(RELAY_PIN, LOW); // make sure the solenoid is released before reset
+  buzzerPlayNow(SND_RESTART, NOTE_COUNT(SND_RESTART));
+  delay(100);
+  ESP.restart();
+}
+
 void checkKeypad() {
   char key = keypad.getKey();
   if (!key) {
@@ -1037,8 +1067,8 @@ void checkKeypad() {
     pinBuffer = "";
     pinEntryActive = false;
     resetMfaSession();
-    Serial.println("MFA session and PIN cleared by user (*).");
-    buzzerPlayNow(SND_DENIED, NOTE_COUNT(SND_DENIED));
+    Serial.println("MFA session and PIN cleared by user (*) - hold * to restart.");
+    buzzerPlayNow(SND_CLEARED, NOTE_COUNT(SND_CLEARED));
   } else if (pinBuffer.length() < PIN_MAX_LEN) {
     pinBuffer += key;
     Serial.printf("Keypad PIN digit added (%d/%d)\n", pinBuffer.length(), PIN_MAX_LEN);
@@ -1430,6 +1460,9 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     HTTPClient http;
     String url = String(SERVER_URL) + "/api/access";
     http.begin(url);
+    // Bound the TCP connect as well as the read, so a dead link / unreachable server
+    // drops to the offline cache below quickly instead of waiting out the core default.
+    http.setConnectTimeout(ACCESS_HTTP_TIMEOUT_MS);
     http.setTimeout(ACCESS_HTTP_TIMEOUT_MS);
     http.addHeader("X-Device-Token", DEVICE_API_KEY);
     http.addHeader("Accept", "application/json");
@@ -1957,11 +1990,11 @@ void sendHeartbeat() {
 // WI-FI CONNECTION
 // -------------------------------------------------------------------------------------
 void connectWiFi() {
-  WiFiManager wm;
   wm.setConnectTimeout(WIFI_CONNECT_TIMEOUT_S);
-  // If no one configures it, fall through and boot in offline mode (local credential
-  // cache still works) - maintainWiFi() keeps retrying the saved network from loop().
-  wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
+  wm.setSaveConnectTimeout(WIFI_SAVE_CONNECT_TIMEOUT_S);
+  // Non-blocking: autoConnect() returns right after opening the AP and maintainWiFi()
+  // services the portal via wm.process(), so the door stays usable during setup.
+  wm.setConfigPortalBlocking(false);
   wm.setAPCallback([](WiFiManager* mgr) {
     Serial.printf("Wi-Fi setup portal open - join AP \"%s\" and browse to %s\n",
                   mgr->getConfigPortalSSID().c_str(), WiFi.softAPIP().toString().c_str());
@@ -1973,7 +2006,19 @@ void connectWiFi() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  Serial.println("Connecting to saved Wi-Fi network...");
+
+  // Always open the portal when the connect fails. Disabling it whenever *any* SSID was
+  // in NVS meant stale credentials (e.g. left over from an older sketch that called
+  // WiFi.begin() with a compiled-in network) hid the setup AP permanently. With no saved
+  // network the portal stays up until configured; with one, it closes after
+  // WIFI_PORTAL_TIMEOUT_S and maintainWiFi() goes back to retrying the saved network.
+  bool haveSavedNetwork = wm.getWiFiIsSaved();
+  wm.setConfigPortalTimeout(haveSavedNetwork ? WIFI_PORTAL_TIMEOUT_S : 0);
+  if (haveSavedNetwork) {
+    Serial.printf("Connecting to saved Wi-Fi network \"%s\"...\n", wm.getWiFiSSID(true).c_str());
+  } else {
+    Serial.println("No saved Wi-Fi network - opening setup portal...");
+  }
 
   if (wm.autoConnect(apName, WIFI_PORTAL_PASSWORD)) {
     Serial.printf("Wi-Fi Connected to %s\n", WiFi.SSID().c_str());
@@ -1981,16 +2026,27 @@ void connectWiFi() {
     Serial.println(WiFi.localIP());
     buzzerPlayNow(SND_WIFI_OK, NOTE_COUNT(SND_WIFI_OK));
   } else {
-    Serial.println("Wi-Fi not configured/unreachable - running offline, will keep retrying.");
+    Serial.println("Wi-Fi not connected - running offline while the setup portal is open.");
     buzzerPlayNow(SND_WIFI_FAIL, NOTE_COUNT(SND_WIFI_FAIL));
   }
 }
 
-// Non-blocking background reconnect using the credentials saved by the portal - never
-// reopens the portal from loop(), so a router outage can't take the lock offline for
-// WIFI_PORTAL_TIMEOUT_S (or trip the 15s watchdog).
+// Services the non-blocking setup portal, then does a background reconnect using the
+// credentials saved by the portal - never reopens the portal from loop(), so a router
+// outage can't take the lock offline (or trip the 15s watchdog).
 void maintainWiFi() {
   static unsigned long lastRetryMs = 0;
+
+  if (wm.getConfigPortalActive()) {
+    // process() handles the portal pages, the save-and-connect, and the portal timeout.
+    // Skip WiFi.reconnect() meanwhile: STA connect attempts hop channels, which drops
+    // phones off the setup AP and makes the portal's network scan come back empty.
+    wm.process();
+    if (wm.getConfigPortalActive()) return;
+    lastRetryMs = millis();
+  }
+
+
   static bool wasConnected = WiFi.status() == WL_CONNECTED;
   bool connected = WiFi.status() == WL_CONNECTED;
 
@@ -2025,7 +2081,6 @@ void checkWifiResetButton() {
   } else if (millis() - pressedSinceMs >= WIFI_RESET_HOLD_MS) {
     Serial.println("BOOT held - erasing saved Wi-Fi credentials and rebooting into setup portal...");
     buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
-    WiFiManager wm;
     wm.resetSettings();
     delay(200);
     ESP.restart();
