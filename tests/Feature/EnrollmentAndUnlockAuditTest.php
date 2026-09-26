@@ -68,6 +68,23 @@ class EnrollmentAndUnlockAuditTest extends TestCase
         $this->assertSame('rfid', Cache::get(Esp32EnrollmentClient::commandCacheKey($token))['command']);
     }
 
+    public function test_device_poll_records_pickup_and_a_new_step_clears_it()
+    {
+        $main  = Device::where('device_type', 'esp32_main')->first();
+        $token = $this->service->startSession($this->admin()->id);
+        $this->service->startPinEnrollment($token);
+
+        $this->assertNull(Cache::get(Esp32EnrollmentClient::pickupCacheKey($token)));
+
+        $this->getJson("/api/esp32/enroll/poll?device_id={$main->id}")
+            ->assertJson(['status' => 'command_pending', 'command' => 'pin']);
+        $this->assertSame('pin', Cache::get(Esp32EnrollmentClient::pickupCacheKey($token)));
+
+        // Starting the next step must not inherit the previous step's pickup
+        $this->service->startFingerprintEnrollment($token);
+        $this->assertNull(Cache::get(Esp32EnrollmentClient::pickupCacheKey($token)));
+    }
+
     public function test_abandoned_enrollment_user_is_removed_when_a_new_session_starts()
     {
         $token = $this->service->startSession($this->admin()->id);

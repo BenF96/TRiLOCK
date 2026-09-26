@@ -413,6 +413,14 @@ static uint8_t  bzPriority   = BZ_PRIO_INFO;
 static volatile bool bzPlaying = false;
 static unsigned long bzNoteStart = 0;
 static bool     buzzerMuted  = false;
+
+// True while an enrollment command is running (see EnrollmentModeScope) - lets the
+// enrollment tones through BUZZER_DOOR_EVENTS_ONLY.
+static bool enrollmentModeActive = false;
+struct EnrollmentModeScope {
+  EnrollmentModeScope()  { enrollmentModeActive = true; }
+  ~EnrollmentModeScope() { enrollmentModeActive = false; }
+};
 static SemaphoreHandle_t bzMutex = nullptr;
 
 void buzzerTask(void*);
@@ -472,7 +480,10 @@ void buzzerStop() {
 bool buzzerPlay(const BuzzerNote* seq, uint8_t len, int16_t repeats, uint8_t priority) {
   if (len == 0) return false;
 #if BUZZER_DOOR_EVENTS_ONLY
-  if (seq != SND_SCAN && seq != SND_DOOR_UNLOCK && seq != SND_DOOR_LOCK && seq != SND_AJAR &&
+  // Enrollment is exempt: with its start / success / rejected tones filtered out, the
+  // person at the keypad had no cue that the lock was ready or that a PIN was refused.
+  if (!enrollmentModeActive &&
+      seq != SND_SCAN && seq != SND_DOOR_UNLOCK && seq != SND_DOOR_LOCK && seq != SND_AJAR &&
       seq != SND_ACCESS_DENIED && seq != SND_CLEARED && seq != SND_RESTART) return false;
 #endif
 
@@ -1165,16 +1176,24 @@ void pollEnrollmentCommand() {
 
 // 1. HARDWARE KEYPAD PIN ENROLLMENT
 void enrollPinOnKeypad(String sessionToken) {
-  Serial.println(">>> KEYPAD PIN ENROLLMENT MODE ACTIVATED");
+  EnrollmentModeScope enrolling;
+  Serial.println(">>> KEYPAD PIN ENROLLMENT MODE ACTIVATED - type 4-8 digits, then #");
   buzzerPlayNow(SND_REMOTE, NOTE_COUNT(SND_REMOTE));
+
+  // Start clean: nothing typed for a door attempt may leak into the enrolled PIN.
+  pinBuffer = "";
+  pinEntryActive = false;
+  resetMfaSession();
 
   String enrolledPin = "";
   unsigned long startMs = millis();
   unsigned long timeoutMs = 45000; // 45 seconds to type PIN on keypad
+  int keyCount = 0;
 
   while (millis() - startMs < timeoutMs) {
     char key = keypad.getKey();
     if (key) {
+      keyCount++;
       buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
       if (key == '#') {
         if (enrolledPin.length() >= 4 && enrolledPin.length() <= 8) {
@@ -1183,26 +1202,35 @@ void enrollPinOnKeypad(String sessionToken) {
           sendEnrollmentResult("pin", sessionToken, "success", enrolledPin, 0);
           return;
         } else {
+          Serial.printf("PIN enrollment: # pressed with %d digits - need 4-8. Cleared, type it again.\n", enrolledPin.length());
           buzzerPlayNow(SND_DENIED, NOTE_COUNT(SND_DENIED));
           enrolledPin = "";
         }
       } else if (key == '*') {
+        Serial.println("PIN enrollment: cleared (*).");
         enrolledPin = "";
       } else if (enrolledPin.length() < PIN_MAX_LEN) {
         enrolledPin += key;
+        Serial.printf("PIN enrollment: digit %d/%d\n", enrolledPin.length(), PIN_MAX_LEN); // count only, never the digits
       }
     }
     enrollmentWaitTick(); // feeds the WDT (this wait outlasts it) and keeps door relock/alarm running
     delay(20);
   }
 
-  Serial.println("Keypad PIN enrollment timed out.");
+  // Say which it was - "no keys at all" (nobody typed / keypad fault) and "typed but never
+  // pressed #" need different fixes, and both used to show the same message.
+  Serial.printf("Keypad PIN enrollment timed out (%d key presses seen).\n", keyCount);
   buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
-  sendEnrollmentResult("pin", sessionToken, "failed", "", 0, "Timeout: No PIN typed on keypad.");
+  sendEnrollmentResult("pin", sessionToken, "failed", "", 0,
+    keyCount == 0
+      ? "Timeout: the keypad registered no key presses in 45s."
+      : "Timeout: digits were typed but # was never pressed with a 4-8 digit PIN.");
 }
 
 // 2. HARDWARE FINGERPRINT ENROLLMENT (AS608 / R503)
 void enrollFingerprintOnSensor(String sessionToken) {
+  EnrollmentModeScope enrolling;
   Serial.println(">>> FINGERPRINT ENROLLMENT MODE ACTIVATED");
   buzzerPlayNow(SND_REMOTE, NOTE_COUNT(SND_REMOTE));
 
@@ -1322,6 +1350,7 @@ void enrollFingerprintOnSensor(String sessionToken) {
 
 // 3. HARDWARE RFID CARD ENROLLMENT (MFRC522)
 void enrollRfidOnSensor(String sessionToken) {
+  EnrollmentModeScope enrolling;
   Serial.println(">>> RFID CARD ENROLLMENT MODE ACTIVATED");
   buzzerPlayNow(SND_REMOTE, NOTE_COUNT(SND_REMOTE));
 

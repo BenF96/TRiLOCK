@@ -88,6 +88,7 @@ class Esp32EnrollmentClient
      */
     public static function queueCommand(string $token, string $command): void
     {
+        Cache::forget(self::pickupCacheKey($token)); // a new step starts un-acknowledged
         Cache::put(
             self::commandCacheKey($token),
             ['command' => $command, 'queued_at' => now()->toIso8601String()],
@@ -101,6 +102,19 @@ class Esp32EnrollmentClient
      */
     public static function dequeueCommand(string $token): ?array
     {
-        return Cache::pull(self::commandCacheKey($token));
+        $cmd = Cache::pull(self::commandCacheKey($token));
+        if ($cmd) {
+            // The device has it and is entering enrollment mode now - the wizard waits for
+            // this before telling the person at the door to start (see
+            // EnrollmentController::waitForDevicePickup()).
+            Cache::put(self::pickupCacheKey($token), $cmd['command'], 600);
+        }
+        return $cmd;
+    }
+
+    /** Which command the ESP32 has picked up for this session (null = not yet). */
+    public static function pickupCacheKey(string $token): string
+    {
+        return "enroll_pickup_{$token}";
     }
 }

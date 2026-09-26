@@ -30,6 +30,13 @@ class EnrollmentController extends Controller
     private const RFID_DEVICE_WINDOW        = 60; // 3 + 45s card wait + 8
     private const FINGERPRINT_DEVICE_WINDOW = 90; // 3 + 30s scan + 2s + 10s lift + 30s scan + 8
 
+    /**
+     * How long a step waits for the ESP32 to pick up its command. Covers a normal ~3s
+     * poll plus a door attempt in progress (the lock defers polling during one, up to
+     * its 30s MFA session timeout).
+     */
+    private const PICKUP_TIMEOUT = 35;
+
     public function __construct(
         private readonly EnrollmentService     $service,
         private readonly Esp32EnrollmentClient $esp32,
@@ -149,11 +156,13 @@ class EnrollmentController extends Controller
                 @ob_end_flush();
             }
 
-            $start = time();
+            $this->sseSend('status', 'Waiting for the lock to enter PIN enrollment mode...');
+            if (!$this->waitForDevicePickup($token, 'pin')) {
+                return;
+            }
 
-            $this->sseSend('status', 'Connecting to ESP32 Keypad...');
-            sleep(1);
-            $this->sseSend('status', 'Enter 4–8 digit PIN on Keypad, then press #');
+            $start = time();
+            $this->sseSend('status', 'Lock ready — enter a 4–8 digit PIN on the keypad, then press #');
 
             while ((time() - $start) < $timeout) {
                 $result = Cache::get(Esp32EnrollmentClient::pinCacheKey($token));
@@ -247,11 +256,13 @@ class EnrollmentController extends Controller
                 @ob_end_flush();
             }
 
-            $start = time();
+            $this->sseSend('status', 'Waiting for the lock to enter fingerprint enrollment mode...');
+            if (!$this->waitForDevicePickup($token, 'fingerprint')) {
+                return;
+            }
 
-            $this->sseSend('status', 'Connecting to ESP32 Fingerprint Sensor...');
-            sleep(1);
-            $this->sseSend('status', 'Place finger on AS608/R503 sensor');
+            $start = time();
+            $this->sseSend('status', 'Lock ready — place finger on the sensor');
 
             while ((time() - $start) < $timeout) {
                 $result = Cache::get(Esp32EnrollmentClient::fingerprintCacheKey($token));
@@ -330,11 +341,13 @@ class EnrollmentController extends Controller
                 @ob_end_flush();
             }
 
-            $start = time();
+            $this->sseSend('status', 'Waiting for the lock to enter RFID enrollment mode...');
+            if (!$this->waitForDevicePickup($token, 'rfid')) {
+                return;
+            }
 
-            $this->sseSend('status', 'Connecting to ESP32 RFID Reader...');
-            sleep(1);
-            $this->sseSend('status', 'Tap RFID Card on MFRC522 module');
+            $start = time();
+            $this->sseSend('status', 'Lock ready — tap the RFID card on the reader');
 
             while ((time() - $start) < $timeout) {
                 $result = Cache::get(Esp32EnrollmentClient::rfidCacheKey($token));
@@ -414,6 +427,46 @@ class EnrollmentController extends Controller
         } catch (\Throwable $e) {
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
         }
+    }
+
+    /**
+     * Holds the step's SSE stream until the ESP32 has actually picked the command up.
+     * The prompt used to appear ~1s after the step started, but the lock only polls every
+     * ~3s - and not at all while someone is mid-entry at its keypad. Anyone who typed
+     * right away was typing into the normal door-unlock flow (which in turn held off the
+     * poll), and the lock entered enrollment mode after they'd finished, then timed out.
+     *
+     * Returns false (having sent step_error) if the lock never picks it up.
+     */
+    private function waitForDevicePickup(string $token, string $command): bool
+    {
+        $start = time();
+        $hinted = false;
+
+        while ((time() - $start) < self::PICKUP_TIMEOUT) {
+            if (Cache::get(Esp32EnrollmentClient::pickupCacheKey($token)) === $command) {
+                return true;
+            }
+
+            if (!$hinted && (time() - $start) >= 8) {
+                $hinted = true;
+                $this->sseSend('status', 'Still waiting for the lock… it only picks up enrollment commands when nobody is using its keypad or scanner — let any attempt at the door finish or time out.');
+            }
+
+            echo ": ping\n\n";
+            if (ob_get_level() > 0) {
+                @ob_flush();
+            }
+            @flush();
+
+            sleep(1);
+        }
+
+        // Withdraw it, so the lock can't drop into enrollment mode later with nobody there.
+        $this->esp32->cancelEnrollment($token);
+        $this->sseSend('step_error', 'The lock did not respond. Check it is online (Devices page) and that nobody is mid-entry at the keypad, then try again.');
+
+        return false;
     }
 
     private function streamTimeout(int $deviceWindow): int
