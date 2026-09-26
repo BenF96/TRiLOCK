@@ -35,6 +35,12 @@ class RfidController extends Controller
 
     public function store(Request $request)
     {
+        // Normalise first - the unique rule compares strings, so "A4B912FD" would otherwise
+        // pass as unique next to an existing "A4 B9 12 FD" (the same physical card).
+        if ($request->filled('card_uid')) {
+            $request->merge(['card_uid' => RfidCard::normalizeUid($request->input('card_uid'))]);
+        }
+
         $validated = $request->validate([
             'card_uid' => 'required|string|max:50|unique:rfid_cards,card_uid',
             'user_id' => 'nullable|exists:users,id',
@@ -42,7 +48,7 @@ class RfidController extends Controller
         ]);
 
         $card = RfidCard::create([
-            'card_uid' => strtoupper($validated['card_uid']),
+            'card_uid' => $validated['card_uid'],
             'user_id' => $validated['user_id'] ?? null,
             'status' => $validated['status'] ?? 'active',
             'assigned_at' => $validated['user_id'] ? now() : null,

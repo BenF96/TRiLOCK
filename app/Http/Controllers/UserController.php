@@ -48,6 +48,12 @@ class UserController extends Controller
 
     public function store(Request $request)
     {
+        // Normalise first - the unique rule compares strings, so "A4B912FD" would otherwise
+        // pass as unique next to an existing "A4 B9 12 FD" (the same physical card).
+        if ($request->filled('card_uid')) {
+            $request->merge(['card_uid' => RfidCard::normalizeUid($request->input('card_uid'))]);
+        }
+
         $validated = $request->validate([
             'employee_student_id' => 'required|string|max:100|unique:users,employee_student_id',
             'first_name' => 'required|string|max:255',
@@ -82,7 +88,7 @@ class UserController extends Controller
         if (!empty($validated['card_uid'])) {
             RfidCard::create([
                 'user_id' => $user->id,
-                'card_uid' => strtoupper($validated['card_uid']),
+                'card_uid' => $validated['card_uid'],
                 'status' => 'active',
                 'assigned_at' => now(),
             ]);

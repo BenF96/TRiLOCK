@@ -334,7 +334,7 @@ class EnrollmentService
      */
     public function receiveRfidResult(string $token, string $rfidUid): void
     {
-        $uid = strtoupper($rfidUid);
+        $uid = RfidCard::normalizeUid($rfidUid);
 
         // Duplicate check
         if (RfidCard::where('card_uid', $uid)->exists()) {

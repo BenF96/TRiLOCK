@@ -31,11 +31,13 @@ class EnrollmentController extends Controller
     private const FINGERPRINT_DEVICE_WINDOW = 90; // 3 + 30s scan + 2s + 10s lift + 30s scan + 8
 
     /**
-     * How long a step waits for the ESP32 to pick up its command. Covers a normal ~3s
-     * poll plus a door attempt in progress (the lock defers polling during one, up to
-     * its 30s MFA session timeout).
+     * How long a step waits for the ESP32 to pick up its command. The lock only starts
+     * polling for commands once its heartbeat (every 30s) says an enrollment is open for
+     * it, then polls every ~3s - and it defers that while a door attempt is in progress.
+     * The session opens when the wizard loads, so by the first step the lock is usually
+     * already polling; this covers the worst case.
      */
-    private const PICKUP_TIMEOUT = 35;
+    private const PICKUP_TIMEOUT = 45;
 
     public function __construct(
         private readonly EnrollmentService     $service,
@@ -450,7 +452,7 @@ class EnrollmentController extends Controller
 
             if (!$hinted && (time() - $start) >= 8) {
                 $hinted = true;
-                $this->sseSend('status', 'Still waiting for the lock… it only picks up enrollment commands when nobody is using its keypad or scanner — let any attempt at the door finish or time out.');
+                $this->sseSend('status', 'Still waiting for the lock… it checks in every 30 seconds, and waits while someone is using its keypad or scanner — let any attempt at the door finish.');
             }
 
             echo ": ping\n\n";

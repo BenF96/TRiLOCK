@@ -97,18 +97,19 @@ class EnrollmentApiTest extends TestCase
 
         $response = $this->postJson('/api/esp32/enroll/rfid/result', [
             'session_token' => $token,
-            'rfid_uid'      => 'A1 B2 C3 D4',
+            // Not the seeded card (A1B2C3D4 == 'A1 B2 C3 D4' once normalised)
+            'rfid_uid'      => '5E 6F 70 81',
             'status'        => 'success',
         ]);
 
         $response->assertStatus(200)
             ->assertJson([
                 'status'  => 'ok',
-                'message' => 'RFID UID A1 B2 C3 D4 received.',
+                'message' => 'RFID UID 5E 6F 70 81 received.',
             ]);
 
         $session = $service->getSession($token);
-        $this->assertEquals('A1 B2 C3 D4', $session['rfid_uid']);
+        $this->assertEquals('5E 6F 70 81', $session['rfid_uid']);
     }
 
     public function test_esp32_enroll_fingerprint_result_stores_template_id()

@@ -116,7 +116,9 @@ void connectWiFi();
 void maintainWiFi();
 void checkWifiResetButton();
 void checkSerialCommands();
+void logIfSlow(const char* what, unsigned long startedMs);
 void runKeypadTest();
+void runRfidTest();
 
 // -------------------------------------------------------------------------------------
 // CONFIGURATION & PINS
@@ -408,6 +410,12 @@ unsigned long lastOfflineFlushMs = 0;
 // which would otherwise spam the serial log every OFFLINE_QUEUE_FLUSH_INTERVAL_MS.
 bool offlineQueuePending = false;
 
+// Set from each heartbeat's "enrollment_active": whether an enrollment wizard session is
+// open for this lock, i.e. whether to poll for enrollment commands (see loop()). Starts
+// true, and stays true if the server doesn't send the flag (older server) - that's the
+// previous always-poll behaviour, so enrollment can't break whichever side deploys first.
+bool enrollmentSessionOpen = true;
+
 // -------------------------------------------------------------------------------------
 // BUZZER SUBSYSTEM
 // -------------------------------------------------------------------------------------
@@ -614,10 +622,61 @@ void runKeypadTest() {
   Serial.println("KEYTEST done.");
 }
 
+// RFIDTEST: reader health, then 30s of scanning with NOTHING else running (no network,
+// no keypad/fingerprint), printing every detection and read result. A card that shows
+// up here but not in normal operation means the main loop is too busy/blocked to scan;
+// one that doesn't show up here either is a reader / antenna / power / card problem.
+void runRfidTest() {
+  byte version = rfid.PCD_ReadRegister(MFRC522::VersionReg);
+  byte txControl = rfid.PCD_ReadRegister(MFRC522::TxControlReg);
+  Serial.printf("RFIDTEST: VersionReg=0x%02X (%s), antenna %s (TxControlReg=0x%02X), gain=0x%02X\n",
+                version,
+                (version == 0x00 || version == 0xFF) ? "NOT RESPONDING on SPI" : "responding",
+                (txControl & 0x03) == 0x03 ? "ON" : "OFF", txControl,
+                rfid.PCD_GetAntennaGain());
+  if ((txControl & 0x03) != 0x03) {
+    Serial.println("RFIDTEST: antenna was off - turning it on.");
+    rfid.PCD_AntennaOn();
+  }
+
+  Serial.println("RFIDTEST: tap / hold a card on the reader (30s)...");
+  unsigned long startMs = millis();
+  unsigned long polls = 0;
+  int detections = 0, reads = 0;
+  while (millis() - startMs < 30000) {
+    polls++;
+    if (isRfidCardPresent()) {
+      detections++;
+      MFRC522::StatusCode st = rfid.PICC_Select(&rfid.uid);
+      if (st == MFRC522::STATUS_OK) {
+        reads++;
+        String uid = "";
+        for (byte i = 0; i < rfid.uid.size; i++) {
+          if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+          uid += String(rfid.uid.uidByte[i], HEX);
+          if (i < rfid.uid.size - 1) uid += " ";
+        }
+        uid.toUpperCase();
+        Serial.printf("  %5lums  card read OK: %s (SAK 0x%02X)\n", millis() - startMs, uid.c_str(), rfid.uid.sak);
+        rfid.PICC_HaltA();
+        rfid.PCD_StopCrypto1();
+        delay(300); // don't flood while the card rests on the reader
+      } else {
+        Serial.printf("  %5lums  card detected, UID read FAILED: %s\n", millis() - startMs,
+                      (const char*)MFRC522::GetStatusCodeName(st));
+      }
+    }
+    esp_task_wdt_reset();
+    delay(10);
+  }
+  Serial.printf("RFIDTEST done: %lu polls, %d detections, %d successful reads.\n", polls, detections, reads);
+}
+
 // Serial commands for bench checks:
 //   BUZZER_TEST - plays the unlock then the lock tone without touching the solenoid
 //   STATUS      - prints the limit switch reading, lock state and Wi-Fi
 //   KEYTEST     - 30s keypad matrix diagnostic (see runKeypadTest())
+//   RFIDTEST    - reader health + 30s isolated RFID scan (see runRfidTest())
 void checkSerialCommands() {
   if (!Serial.available()) return;
   String cmd = Serial.readStringUntil('\n');
@@ -634,6 +693,8 @@ void checkSerialCommands() {
     Serial.println("Buzzer test done.");
   } else if (cmd == "KEYTEST") {
     runKeypadTest();
+  } else if (cmd == "RFIDTEST") {
+    runRfidTest();
   } else if (cmd == "STATUS") {
     Serial.printf("Limit switch GPIO%d raw=%d -> door %s | solenoid %s | auto-lock %s | Wi-Fi %s %s\n",
                   LIMIT_SWITCH_PIN, digitalRead(LIMIT_SWITCH_PIN), doorClosed ? "CLOSED" : "OPEN",
@@ -707,7 +768,14 @@ void setup() {
   // Initialize Fingerprint Sensor (UART2: RX2=GPIO17 <- sensor TX, TX2=GPIO16 -> sensor RX)
   mySerial.begin(57600, SERIAL_8N1, 17, 16);
   finger.begin(57600);
-  if (finger.verifyPassword()) {
+  // R307/AS608 modules take a moment to start answering after power-up. Checked once,
+  // this reported "not responding" on some boots and not others; retry for ~2s first.
+  bool fingerOk = false;
+  for (int attempt = 0; attempt < 8 && !fingerOk; attempt++) {
+    fingerOk = finger.verifyPassword();
+    if (!fingerOk) delay(250);
+  }
+  if (fingerOk) {
     Serial.println("Fingerprint Sensor Found & Verified!");
   } else {
     Serial.println("Warning: Fingerprint Sensor not responding.");
@@ -770,6 +838,16 @@ void setup() {
 // -------------------------------------------------------------------------------------
 // MAIN LOOP
 // -------------------------------------------------------------------------------------
+// While a background network call runs, loop() is stuck in it - no RFID, keypad or
+// fingerprint scanning. Log the ones long enough for a quick card tap to be missed.
+#define SLOW_CALL_LOG_MS 800
+void logIfSlow(const char* what, unsigned long startedMs) {
+  unsigned long took = millis() - startedMs;
+  if (took >= SLOW_CALL_LOG_MS) {
+    Serial.printf("[loop] %s took %lums - card/keypad/fingerprint not scanned meanwhile\n", what, took);
+  }
+}
+
 void loop() {
   // Feed Hardware Watchdog Timer
   esp_task_wdt_reset();
@@ -816,6 +894,7 @@ void loop() {
   if (!userInteracting && millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatMs = millis();
     sendHeartbeat();
+    logIfSlow("heartbeat", lastHeartbeatMs);
     esp_task_wdt_reset(); // re-feed in case the call above blocked for a while
   }
 
@@ -823,6 +902,7 @@ void loop() {
   if (!userInteracting && millis() - lastSettingsRefreshMs >= SETTINGS_REFRESH_INTERVAL_MS) {
     lastSettingsRefreshMs = millis();
     fetchServerSettings();
+    logIfSlow("settings refresh", lastSettingsRefreshMs);
     esp_task_wdt_reset();
   }
 
@@ -830,6 +910,7 @@ void loop() {
   if (!userInteracting && millis() - lastOfflineSyncMs >= OFFLINE_SYNC_INTERVAL_MS) {
     lastOfflineSyncMs = millis();
     syncOfflineCache();
+    logIfSlow("offline cache sync", lastOfflineSyncMs);
     esp_task_wdt_reset();
   }
 
@@ -839,15 +920,21 @@ void loop() {
   if (!userInteracting && millis() - lastOfflineFlushMs >= OFFLINE_QUEUE_FLUSH_INTERVAL_MS) {
     lastOfflineFlushMs = millis();
     flushOfflineQueue();
+    logIfSlow("offline queue flush", lastOfflineFlushMs);
     esp_task_wdt_reset();
   }
 
   // 10. Poll server for pending enrollment commands (every 3s) - by far the most frequent
   // background call, and so the dominant source of keypad lag before this guard.
+  // Only while the server says an enrollment is open for this lock (heartbeat flag).
+  // Each poll is a fresh HTTPS request that blocks this loop for ~1.5-2s; polling every
+  // 3s around the clock kept the loop blocked ~60% of the time, so most card taps,
+  // keypresses and finger scans were never seen.
   static unsigned long lastEnrollPollMs = 0;
-  if (!userInteracting && millis() - lastEnrollPollMs >= 3000) {
+  if (!userInteracting && enrollmentSessionOpen && millis() - lastEnrollPollMs >= 3000) {
     lastEnrollPollMs = millis();
     pollEnrollmentCommand();
+    logIfSlow("enrollment poll", lastEnrollPollMs);
     esp_task_wdt_reset();
   }
 
@@ -1041,7 +1128,17 @@ bool readRfidCard(String &cardUidOut) {
   if (!isRfidCardPresent()) {
     return false;
   }
-  if (!rfid.PICC_ReadCardSerial()) {
+  // PICC_ReadCardSerial() is just PICC_Select() reduced to a bool - call it directly so a
+  // card that answers but whose UID can't be read (weak coupling, clone quirks, receiver
+  // saturation) is reported instead of looking exactly like "no card at all".
+  MFRC522::StatusCode selectStatus = rfid.PICC_Select(&rfid.uid);
+  if (selectStatus != MFRC522::STATUS_OK) {
+    static unsigned long lastSelectFailLogMs = 0;
+    if (millis() - lastSelectFailLogMs > 2000) {
+      lastSelectFailLogMs = millis();
+      Serial.printf("RFID: card detected but UID read failed (%s) - hold the card flat and still on the reader.\n",
+                    (const char*)MFRC522::GetStatusCodeName(selectStatus));
+    }
     return false;
   }
 
@@ -2303,6 +2400,15 @@ void sendHeartbeat() {
     String response = http.getString();
     JsonDocument respDoc;
     deserializeJson(respDoc, response);
+
+    if (!respDoc["enrollment_active"].isNull()) {
+      bool open = respDoc["enrollment_active"].as<bool>();
+      if (open != enrollmentSessionOpen) {
+        Serial.println(open ? "Enrollment session open - polling for enrollment commands."
+                            : "No enrollment session - enrollment polling paused.");
+      }
+      enrollmentSessionOpen = open;
+    }
 
     const char* pendingCmd = respDoc["pending_command"];
     if (pendingCmd && String(pendingCmd) == "unlock") {

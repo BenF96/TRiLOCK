@@ -106,7 +106,7 @@ class HardwareApiController extends Controller
         $user         = null;
         $denialReason = null;
         $authMethod   = $validated['auth_method'];
-        $cardUid      = !empty($validated['card_uid']) ? strtoupper($validated['card_uid']) : null;
+        $cardUid      = !empty($validated['card_uid']) ? RfidCard::normalizeUid($validated['card_uid']) : null;
         $fpId         = !empty($validated['fingerprint_id']) ? (int) $validated['fingerprint_id'] : null;
         $pinCode      = !empty($validated['pin_code']) ? $validated['pin_code'] : null;
 
@@ -317,7 +317,7 @@ class HardwareApiController extends Controller
         // as the online path does.
         if (!empty($validated['denial_reason'])) {
             if (!$user && !empty($validated['card_uid'])) {
-                $user = RfidCard::with('user')->where('card_uid', strtoupper($validated['card_uid']))->first()?->user;
+                $user = RfidCard::with('user')->where('card_uid', RfidCard::normalizeUid($validated['card_uid']))->first()?->user;
             }
 
             $log = AccessLog::create([
@@ -512,6 +512,11 @@ class HardwareApiController extends Controller
             'pending_command'         => $pendingCmd['command'] ?? null,
             'duration'                => $pendingCmd['duration'] ?? null,
             'deleted_fingerprint_ids' => $pendingCmd['deleted_fingerprint_ids'] ?? [],
+            // The lock only polls /api/esp32/enroll/poll while this is true. Each poll is a
+            // fresh HTTPS request (~1.5-2s on the ESP32) that blocks its scan loop, and
+            // polling every 3s around the clock left it unable to see a card tap, keypress
+            // or finger most of the time.
+            'enrollment_active'       => Cache::has("active_enrollment_token_{$validated['device_id']}"),
             'time'                    => now()->toDateTimeString(),
         ]);
     }

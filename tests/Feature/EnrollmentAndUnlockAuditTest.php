@@ -85,6 +85,22 @@ class EnrollmentAndUnlockAuditTest extends TestCase
         $this->assertNull(Cache::get(Esp32EnrollmentClient::pickupCacheKey($token)));
     }
 
+    public function test_heartbeat_tells_the_lock_when_to_poll_for_enrollment()
+    {
+        $main = Device::where('device_type', 'esp32_main')->first();
+
+        $this->postJson('/api/heartbeat', ['device_id' => $main->id])
+            ->assertJson(['enrollment_active' => false]);
+
+        $token = $this->service->startSession($this->admin()->id);
+        $this->postJson('/api/heartbeat', ['device_id' => $main->id])
+            ->assertJson(['enrollment_active' => true]);
+
+        $this->service->cancel($token);
+        $this->postJson('/api/heartbeat', ['device_id' => $main->id])
+            ->assertJson(['enrollment_active' => false]);
+    }
+
     public function test_abandoned_enrollment_user_is_removed_when_a_new_session_starts()
     {
         $token = $this->service->startSession($this->admin()->id);
