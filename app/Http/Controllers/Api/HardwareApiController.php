@@ -76,8 +76,11 @@ class HardwareApiController extends Controller
         // Current LAN IP of the ESP32-CAM (from its own heartbeat), handed back to the main
         // controller so it can trigger a capture with a direct Wi-Fi call instead of relying
         // on a physical UART wire between the two boards.
+        // Only a camera that's actually online: a stale IP makes the lock wait out a
+        // connect timeout before it unlocks, with the person standing at the door.
         $cameraIp = Device::where('device_type', 'esp32_cam')
             ->whereNotNull('ip_address')
+            ->where('last_seen', '>', now()->subSeconds(Device::ONLINE_THRESHOLD_SECONDS))
             ->orderByDesc('last_seen')
             ->value('ip_address');
 
@@ -268,7 +271,9 @@ class HardwareApiController extends Controller
 
     /**
      * POST /api/access/offline-log
-     * Backfills a door unlock that the ESP32 main controller already granted locally
+     * Backfills an access event decided on-device while the server was unreachable:
+     * either a denied attempt (denial_reason set), or a door unlock the ESP32 main
+     * controller already granted locally
      * (matched against its cached RFID+fingerprint+PIN combo) while the server was
      * unreachable. The access decision was already made on-device at the same security
      * bar as the online path - this endpoint only records it so it appears on the
@@ -279,13 +284,15 @@ class HardwareApiController extends Controller
     {
         $validated = $request->validate([
             'device_id'      => 'required|integer',
-            'user_id'        => 'required|integer|exists:users,id',
+            // Grants carry the user the device matched; denials have none
+            'user_id'        => 'required_without:denial_reason|nullable|integer|exists:users,id',
             'card_uid'       => 'nullable|string',
             'fingerprint_id' => 'nullable|integer',
             'occurred_at'    => 'nullable|integer',
+            'denial_reason'  => 'nullable|string|in:' . implode(',', AccessLog::OFFLINE_DENIAL_REASONS),
         ]);
 
-        $user = User::find($validated['user_id']);
+        $user = !empty($validated['user_id']) ? User::find($validated['user_id']) : null;
 
         $this->touchDevice($validated['device_id']);
 
@@ -299,6 +306,34 @@ class HardwareApiController extends Controller
             if ($ts->between(now()->subDays(30), now()->addMinutes(5))) {
                 $occurredAt = $ts;
             }
+        }
+
+        // Failed attempts made while the server was unreachable - recorded so an outage
+        // doesn't hide what happened at the door. Attributed to the card's owner, if any,
+        // as the online path does.
+        if (!empty($validated['denial_reason'])) {
+            if (!$user && !empty($validated['card_uid'])) {
+                $user = RfidCard::with('user')->where('card_uid', strtoupper($validated['card_uid']))->first()?->user;
+            }
+
+            $log = AccessLog::create([
+                'user_id'               => $user?->id,
+                'authentication_method' => 'unauthorized',
+                'access_type'           => 'denied',
+                'denial_reason'         => $validated['denial_reason'],
+                'captured_image'        => null,
+                'door_status'           => 'locked',
+                'date'                  => $occurredAt->toDateString(),
+                'time'                  => $occurredAt->toTimeString(),
+                'device_id'             => $validated['device_id'],
+            ]);
+            Cache::forget('trilock_dashboard_status');
+
+            return response()->json([
+                'status'        => 'success',
+                'message'       => 'Offline denied attempt logged',
+                'access_log_id' => $log->id,
+            ]);
         }
 
         $log = AccessLog::create([

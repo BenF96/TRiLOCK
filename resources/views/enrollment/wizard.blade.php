@@ -474,10 +474,14 @@
             </div>
         </div>
 
-        <div x-show="pinState!=='done'&&!fp.id&&!rfid.uid"
+        {{-- The door requires all three factors together, so ANY skipped one blocks access --}}
+        <div x-show="pinState!=='done'||!fp.id||!rfid.uid"
              class="flex items-center gap-2 p-3 rounded-xl bg-amber-900/20 border border-amber-700/30 text-xs text-amber-300">
             <i class="fa-solid fa-triangle-exclamation text-amber-400 shrink-0"></i>
-            No credentials enrolled — user won't be able to access the lab until credentials are assigned.
+            <span>
+                <span x-text="[pinState!=='done'?'PIN':null, !fp.id?'Fingerprint':null, !rfid.uid?'RFID card':null].filter(Boolean).join(', ')"></span>
+                not enrolled — the door requires PIN + fingerprint + RFID together, so this user can't unlock it until the missing credential(s) are assigned.
+            </span>
         </div>
 
         <div class="flex justify-between pt-3 border-t border-slate-800/60">

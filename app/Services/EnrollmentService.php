@@ -47,6 +47,22 @@ class EnrollmentService
      */
     public function startSession(int $adminId, ?int $deviceId = null): string
     {
+        // The ESP32 only ever polls with its own device_id, so a session with no device
+        // bound would queue commands nobody picks up - the wizard would just time out at
+        // every step. Default to the only controller if there's exactly one.
+        if (!$deviceId) {
+            $controllers = \App\Models\Device::where('device_type', 'esp32_main')->pluck('id');
+            if ($controllers->isEmpty()) {
+                throw new \RuntimeException('No ESP32 main controller is registered. Add one under Devices first.');
+            }
+            if ($controllers->count() > 1) {
+                throw new \RuntimeException('Select which ESP32 controller will perform the enrollment.');
+            }
+            $deviceId = $controllers->first();
+        }
+
+        $this->pruneAbandonedSessions();
+
         $token = Str::random(48);
 
         Cache::put("enrollment_session_{$token}", [
@@ -187,11 +203,7 @@ class EnrollmentService
             throw new \RuntimeException('Invalid PIN format received from keypad.');
         }
 
-        // Duplicate check
-        $duplicate = AccessPin::where('status', 'active')->get()->first(
-            fn($p) => Hash::check($plainPin, $p->pin_code)
-        );
-        if ($duplicate) {
+        if ($this->pinInUse($plainPin)) {
             Cache::put(Esp32EnrollmentClient::pinCacheKey($token), [
                 'status'  => 'error',
                 'message' => 'This PIN is already assigned to another user.',
@@ -228,12 +240,7 @@ class EnrollmentService
             throw new \RuntimeException('Invalid or expired enrollment session.');
         }
 
-        // Duplicate check: iterate hashed PINs (they cannot be reversed-indexed)
-        $duplicate = AccessPin::where('status', 'active')->get()->first(
-            fn($p) => Hash::check($plainPin, $p->pin_code)
-        );
-
-        if ($duplicate) {
+        if ($this->pinInUse($plainPin)) {
             throw new \RuntimeException('This PIN is already assigned to another user.');
         }
 
@@ -270,6 +277,23 @@ class EnrollmentService
      */
     public function receiveFingerprintResult(string $token, int $fingerprintId): void
     {
+        // The ESP32 picks the first slot that's empty ON THE SENSOR. If the DB still has a
+        // record for that slot (sensor wiped/replaced, or a template purged by older
+        // firmware), commit() would reject it - but only after the admin finished every
+        // other step, and the device would keep choosing the same slot on each retry.
+        // Say so now, with what to fix.
+        $existing = Fingerprint::with('user')->where('fingerprint_id', $fingerprintId)->first();
+        if ($existing) {
+            $owner = $existing->user?->full_name ?? 'a deleted user';
+            $message = "Sensor slot #{$fingerprintId} is empty on the device but still registered to {$owner} in the database. "
+                     . "Delete that fingerprint record (Fingerprints page), then scan again.";
+            Cache::put(Esp32EnrollmentClient::fingerprintCacheKey($token), [
+                'status'  => 'error',
+                'message' => $message,
+            ], 300);
+            throw new \RuntimeException($message);
+        }
+
         // Store in cache — SSE stream will pick this up
         Cache::put(Esp32EnrollmentClient::fingerprintCacheKey($token), [
             'status'         => 'success',
@@ -448,10 +472,76 @@ class EnrollmentService
             // Non-fatal
         }
 
-        $this->log($token, $session['admin_id'] ?? null, $session['user_id'] ?? null,
-            'cancel', 'rolled_back', [], $reason);
+        // The user row is gone by now - enrolled_user_id is a foreign key to users, so
+        // referencing it made this insert fail (silently, see log()) and every cancel went
+        // unrecorded. Keep the id in the payload instead.
+        $this->log($token, $session['admin_id'] ?? null, null,
+            'cancel', 'rolled_back', ['deleted_user_id' => $session['user_id'] ?? null], $reason);
 
         $this->destroySession($token);
+    }
+
+    /**
+     * Whether an active PIN already uses this code. Matches on the indexed SHA-256
+     * offline_hash - one query - instead of bcrypt-checking every PIN in the system
+     * (~250ms each), which with a few dozen users outlasted the ESP32's 8s timeout for
+     * posting the result. Only legacy PINs saved before offline_hash existed still need
+     * the slow bcrypt comparison.
+     */
+    private function pinInUse(string $plainPin): bool
+    {
+        $offlineHash = hash('sha256', $plainPin.config('trilock.offline_pin_salt'));
+
+        if (AccessPin::where('status', 'active')->where('offline_hash', $offlineHash)->exists()) {
+            return true;
+        }
+
+        return AccessPin::where('status', 'active')->whereNull('offline_hash')->get()
+            ->contains(fn ($p) => Hash::check($plainPin, $p->pin_code));
+    }
+
+    /**
+     * The user row is created at step 1, long before commit. A wizard abandoned after
+     * that (tab closed, browser crash) left a credential-less user behind forever, since
+     * its session simply expired from the cache. Roll those back - runs opportunistically
+     * whenever a new session starts, so no scheduler is needed.
+     */
+    public function pruneAbandonedSessions(): int
+    {
+        $pruned = 0;
+
+        $candidates = EnrollmentLog::where('step', 'user_info')
+            ->where('status', 'completed')
+            ->where('created_at', '<', now()->subSeconds(self::SESSION_TTL))
+            ->whereNotNull('enrolled_user_id')
+            ->whereNotIn('session_token', EnrollmentLog::whereIn('step', ['commit', 'cancel'])->select('session_token'))
+            ->orderBy('id')
+            ->limit(20)
+            ->get();
+
+        foreach ($candidates as $entry) {
+            if ($this->getSession($entry->session_token)) {
+                continue; // still live in the cache (TTL refreshed by recent activity)
+            }
+
+            $user = User::withCount(['rfidCards', 'fingerprints', 'accessPins'])->find($entry->enrolled_user_id);
+            // Credentials are only ever written at commit - anything holding one was
+            // committed (or edited by an admin since) and must not be touched.
+            if ($user && $user->rfid_cards_count + $user->fingerprints_count + $user->access_pins_count === 0) {
+                if ($user->photo) {
+                    Storage::delete($user->photo);
+                }
+                $user->delete();
+                $pruned++;
+            }
+
+            // enrolled_user_id must be null - it's a foreign key and the user may be gone
+            $this->log($entry->session_token, $entry->admin_id, null,
+                'cancel', 'rolled_back', ['deleted_user_id' => $entry->enrolled_user_id],
+                'Enrollment abandoned (session expired before commit) - partial user removed');
+        }
+
+        return $pruned;
     }
 
     // -------------------------------------------------------------------------

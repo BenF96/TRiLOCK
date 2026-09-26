@@ -88,13 +88,15 @@ void resetMfaSession();
 void printMfaStatus();
 void checkDoorSensor();
 void checkDoorAjar();
+void serviceDoor();
+void enrollmentWaitTick();
 void checkRemoteUnlockServer();
 void triggerCameraCapture(String cameraIp, int accessLogId);
 void pollEnrollmentCommand();
 void enrollPinOnKeypad(String sessionToken);
 void enrollFingerprintOnSensor(String sessionToken);
 void enrollRfidOnSensor(String sessionToken);
-void sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg = "");
+int sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg = "");
 void sendAccessRequest(String method, String accessType, String cardUid, int fingerprintId, String pinCode = "", const char* denialReason = nullptr);
 void syncOfflineCache();
 void deleteFingerprintFromSensor(int fingerprintId);
@@ -102,7 +104,7 @@ std::vector<int> readCachedFingerprintIds(const char* path, bool* parsedOk = nul
 bool tokenMatches(const String& given, const char* expected);
 void purgeRevokedFingerprints(const std::vector<int>& oldIds, const std::vector<int>& newIds);
 bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int &matchedUserId);
-void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId);
+void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId, const char* denialReason);
 void flushOfflineQueue();
 String sha256Hex(String input);
 time_t currentEpoch();
@@ -191,6 +193,7 @@ const int DEVICE_ID       = 4; // Device ID in TRILOCK database
 // time connectivity returns and the event backfills, there is no one left to photograph.
 #define OFFLINE_QUEUE_PATH         "/offline_queue.jsonl"
 #define OFFLINE_QUEUE_MAX_ENTRIES  50     // Bound flash usage if the device stays offline a long time
+#define OFFLINE_QUEUE_GRANT_RESERVE 10    // Slots only grants may use (see queueOfflineAccessEvent())
 #define OFFLINE_QUEUE_FLUSH_INTERVAL_MS 45000
 // Entries sent per flush tick. Each is a blocking HTTPS POST of up to a few seconds, so
 // flushing a full queue in one pass could run far past the 15s watchdog - and a reboot
@@ -346,6 +349,13 @@ bool ledRedActive = false;
 unsigned long lockoutUntilMs = 0;
 bool lockoutActive = false;
 unsigned long lastLockoutToneMs = 0;
+
+// Local mirror of the server's lockout for when it's unreachable (see the offline
+// fallback in sendAccessRequest()). Same defaults as TRILOCK_MAX_FAILED_ATTEMPTS /
+// TRILOCK_LOCKOUT_DURATION on the server.
+#define OFFLINE_MAX_FAILED_ATTEMPTS 5
+#define OFFLINE_LOCKOUT_SECONDS     60
+int offlineFailCount = 0;
 
 // Periodic task timestamps
 unsigned long lastHeartbeatMs = 0;
@@ -678,19 +688,8 @@ void loop() {
   updateStatusLeds();
   checkSerialCommands();
 
-  // 1. Monitor the door limit switch - relocks on an open -> close cycle after an unlock
-  checkDoorSensor();
-
-  // 2. Nobody went through: relock if the door was never opened after an unlock. Both
-  // relock paths are gated by "Auto-Relock Mechanism" - when disabled, the solenoid stays
-  // energized until an explicit remote lock command arrives.
-  if (autoLockEnabled && isDoorUnlocked && !doorOpenedSinceUnlock &&
-      millis() - unlockedAt >= UNOPENED_RELOCK_MS) {
-    lockDoor("Door relocked - not opened after unlock");
-  }
-
-  // 3. Sound the alarm if the door was left hanging open
-  checkDoorAjar();
+  // 1-3. Door limit switch, auto-relock and door-left-open alarm
+  serviceDoor();
 
   // 4. Scan for RFID Card Swipe
   checkRfidCard();
@@ -759,6 +758,32 @@ void loop() {
   }
 
   delay(10); // Short so buzzer note timing stays accurate
+}
+
+// Door safety checks. Called from loop() and from inside every blocking enrollment wait,
+// which can run for over a minute - without it a door unlocked just before enrollment
+// started stayed unlocked (no relock, no ajar alarm) for the whole enrollment.
+void serviceDoor() {
+  // 1. Monitor the door limit switch - relocks on an open -> close cycle after an unlock
+  checkDoorSensor();
+
+  // 2. Nobody went through: relock if the door was never opened after an unlock. Both
+  // relock paths are gated by "Auto-Relock Mechanism" - when disabled, the solenoid stays
+  // energized until an explicit remote lock command arrives.
+  if (autoLockEnabled && isDoorUnlocked && !doorOpenedSinceUnlock &&
+      millis() - unlockedAt >= UNOPENED_RELOCK_MS) {
+    lockDoor("Door relocked - not opened after unlock");
+  }
+
+  // 3. Sound the alarm if the door was left hanging open
+  checkDoorAjar();
+}
+
+// One pass of housekeeping for a blocking enrollment wait loop.
+void enrollmentWaitTick() {
+  esp_task_wdt_reset();
+  updateStatusLeds();
+  serviceDoor();
 }
 
 // -------------------------------------------------------------------------------------
@@ -1024,6 +1049,14 @@ void checkFingerprint() {
 void onKeypadEvent(char key) {
   if (key != '*' || keypad.getState() != HOLD) return;
 
+  // The lockout lives in RAM, so a reboot would wipe it - holding '*' must not be a way
+  // to skip a brute-force lockout (the offline one especially, which nothing else keeps).
+  if (lockoutActive) {
+    Serial.println("* held - restart refused during security lockout.");
+    buzzerPlay(SND_ACCESS_DENIED, NOTE_COUNT(SND_ACCESS_DENIED), 0, BZ_PRIO_EVENT);
+    return;
+  }
+
   Serial.println("* held - restarting controller...");
   digitalWrite(RELAY_PIN, LOW); // make sure the solenoid is released before reset
   buzzerPlayNow(SND_RESTART, NOTE_COUNT(SND_RESTART));
@@ -1159,7 +1192,7 @@ void enrollPinOnKeypad(String sessionToken) {
         enrolledPin += key;
       }
     }
-    esp_task_wdt_reset(); // this wait can run up to timeoutMs, well past the 15s WDT window
+    enrollmentWaitTick(); // feeds the WDT (this wait outlasts it) and keeps door relock/alarm running
     delay(20);
   }
 
@@ -1173,9 +1206,17 @@ void enrollFingerprintOnSensor(String sessionToken) {
   Serial.println(">>> FINGERPRINT ENROLLMENT MODE ACTIVATED");
   buzzerPlayNow(SND_REMOTE, NOTE_COUNT(SND_REMOTE));
 
-  // Find next available slot ID (1-127)
+  // Find next available slot ID (1-127): empty on the sensor AND not registered to anyone
+  // in the DB. A slot can be empty on the sensor yet still registered (sensor wiped or
+  // replaced) - storing a new person's finger there would make it authenticate as the
+  // slot's registered owner.
+  std::vector<int> registeredIds = readCachedFingerprintIds(OFFLINE_CACHE_PATH);
+  auto isRegistered = [&registeredIds](int slot) {
+    for (int r : registeredIds) if (r == slot) return true;
+    return false;
+  };
   int id = 1;
-  while (id <= 127 && finger.loadModel(id) == FINGERPRINT_OK) {
+  while (id <= 127 && (isRegistered(id) || finger.loadModel(id) == FINGERPRINT_OK)) {
     id++;
     esp_task_wdt_reset(); // up to 127 sensor round-trips
   }
@@ -1191,7 +1232,7 @@ void enrollFingerprintOnSensor(String sessionToken) {
   unsigned long startMs = millis();
   while (p != FINGERPRINT_OK && (millis() - startMs < 30000)) {
     p = finger.getImage();
-    esp_task_wdt_reset(); // 30s wait, well past the 15s WDT window
+    enrollmentWaitTick(); // feeds the WDT + door checks during the 30s wait
     delay(100);
   }
   if (p != FINGERPRINT_OK) {
@@ -1205,15 +1246,27 @@ void enrollFingerprintOnSensor(String sessionToken) {
     return;
   }
 
+  // Refuse a finger that's already enrolled. With two templates of the same finger on
+  // the sensor, a scan matches whichever scores higher - it could identify as the other
+  // slot's user. (fingerFastSearch searches the char buffer image2Tz(1) just filled.)
+  if (finger.fingerFastSearch() == FINGERPRINT_OK) {
+    int existingId = finger.fingerID;
+    Serial.printf("Finger already enrolled in slot #%d - rejecting.\n", existingId);
+    buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
+    sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0,
+      "This finger is already enrolled (sensor slot #" + String(existingId) + "). Use a different finger or remove the existing record first.");
+    return;
+  }
+
   buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
   Serial.println("Remove finger...");
-  delay(2000);
+  for (int i = 0; i < 20; i++) { enrollmentWaitTick(); delay(100); } // 2s to lift the finger
 
   p = 0;
   startMs = millis();
   while (p != FINGERPRINT_NOFINGER && (millis() - startMs < 10000)) {
     p = finger.getImage();
-    esp_task_wdt_reset(); // unbounded without the 10s cap - past the 15s WDT window otherwise
+    enrollmentWaitTick();
     delay(100);
   }
 
@@ -1224,7 +1277,7 @@ void enrollFingerprintOnSensor(String sessionToken) {
   startMs = millis();
   while (p != FINGERPRINT_OK && (millis() - startMs < 30000)) {
     p = finger.getImage();
-    esp_task_wdt_reset(); // 30s wait, well past the 15s WDT window
+    enrollmentWaitTick(); // feeds the WDT + door checks during the 30s wait
     delay(100);
   }
   if (p != FINGERPRINT_OK) {
@@ -1253,7 +1306,15 @@ void enrollFingerprintOnSensor(String sessionToken) {
     // enrollment wizard) has had a chance to make it show up as active - see declaration.
     pendingEnrollFingerId = id;
     pendingEnrollFingerMs = millis();
-    sendEnrollmentResult("fingerprint", sessionToken, "success", "", id);
+    int code = sendEnrollmentResult("fingerprint", sessionToken, "success", "", id);
+    if (code != 200) {
+      // Server didn't accept it (slot conflict, expired session) or never heard about it
+      // - either way no DB row will ever point at this template, so don't leave a live
+      // template sitting on the sensor. The wizard retries with a fresh scan.
+      Serial.printf("Fingerprint result not accepted (HTTP %d) - removing template from slot #%d.\n", code, id);
+      deleteFingerprintFromSensor(id);
+      pendingEnrollFingerId = 0;
+    }
   } else {
     sendEnrollmentResult("fingerprint", sessionToken, "failed", "", 0, "Failed to store fingerprint model.");
   }
@@ -1278,7 +1339,7 @@ void enrollRfidOnSensor(String sessionToken) {
       sendEnrollmentResult("rfid", sessionToken, "success", cardUid, 0);
       return;
     }
-    esp_task_wdt_reset(); // 45s wait, feed WDT continuously
+    enrollmentWaitTick(); // feeds the WDT + door checks during the 45s wait
     delay(50);
   }
 
@@ -1290,8 +1351,9 @@ void enrollRfidOnSensor(String sessionToken) {
 // Helper: POST enrollment result back to Laravel API
 // (default for errMsg lives on the prototype above only - repeating it here is illegal
 // in C++, a default argument may be specified in exactly one of the two.)
-void sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg) {
-  if (WiFi.status() != WL_CONNECTED) return;
+// Returns the HTTP status (negative = transport error / no Wi-Fi).
+int sendEnrollmentResult(String type, String token, String status, String valueStr, int valueInt, String errMsg) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
 
   HTTPClient http;
   String endpoint = "/api/esp32/enroll/" + type + "/result";
@@ -1317,6 +1379,7 @@ void sendEnrollmentResult(String type, String token, String status, String value
   int httpCode = http.POST(jsonPayload);
   Serial.printf("Enrollment result [%s] sent to server (HTTP %d)\n", type.c_str(), httpCode);
   http.end();
+  return httpCode;
 }
 
 
@@ -1491,6 +1554,10 @@ void triggerCameraCapture(String cameraIp, int accessLogId) {
   HTTPClient http;
   String url = "http://" + cameraIp + "/capture";
   http.begin(url);
+  // Bound the TCP connect too: setTimeout() only covers the read, so a stale/offline
+  // camera IP waited out the ~5s default connect timeout - and a granted user stood at
+  // the door for all of it, since the unlock waits for this call.
+  http.setConnectTimeout(CAMERA_CAPTURE_HTTP_TIMEOUT_MS);
   http.setTimeout(CAMERA_CAPTURE_HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Token", DEVICE_API_KEY); // the CAM rejects unauthenticated triggers
@@ -1576,24 +1643,29 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
       }
 
       // 2. Unlock Solenoid Door
+      offlineFailCount = 0;
       unlockDoor();
     } else {
       int accessLogId = responseDoc["access_log_id"] | 0;
       const char* reason = responseDoc["reason"] | "unknown";
       Serial.printf("Server denied access: %s (HTTP %d)\n", reason, httpResponseCode);
 
-      // Denied/security captures only respect the master switch - not "Record Entry
-      // Captures", which only concerns successful entries.
-      if (cameraEnabled && accessLogId > 0) {
-        triggerCameraCapture(cameraIp, accessLogId);
-      }
+      // Feedback first - the capture trigger below can block for up to 2s, and the person
+      // shouldn't wait on it to hear they were denied.
       denyAccess();
+      offlineFailCount = 0; // the server is answering - it owns the brute-force count
 
       if (String(status) == "locked_out") {
         startLockout(responseDoc["lockout_seconds"] | 60);
       } else {
         int attemptsLeft = responseDoc["attempts_left"] | -1;
         if (attemptsLeft >= 0) Serial.printf("Attempts left before lockout: %d\n", attemptsLeft);
+      }
+
+      // Denied/security captures only respect the master switch - not "Record Entry
+      // Captures", which only concerns successful entries.
+      if (cameraEnabled && accessLogId > 0) {
+        triggerCameraCapture(cameraIp, accessLogId);
       }
     }
     return;
@@ -1611,18 +1683,32 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
   int offlineUserId = 0;
   if (method == "multi_factor" && attemptOfflineUnlock(cardUid, fingerprintId, pinCode, offlineUserId)) {
     Serial.println(">>> OFFLINE ACCESS GRANTED (matched local cache) <<<");
+    offlineFailCount = 0;
     buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
     unlockDoor();
     // No live server round-trip happened, so this event never reached the dashboard and
     // no CAPTURE was sent (no access_log_id to attach a photo to). Queue it for backfill
     // sync so it still shows up once the server is reachable again.
-    queueOfflineAccessEvent(offlineUserId, cardUid, fingerprintId);
+    queueOfflineAccessEvent(offlineUserId, cardUid, fingerprintId, nullptr);
   } else {
     Serial.println("OFFLINE ACCESS DENIED - no matching cached credential set.");
     denyAccess();
     // Played last so it overrides the denial tone - a connectivity fault should sound
     // audibly different from a rejected card.
     buzzerPlay(SND_ERROR, NOTE_COUNT(SND_ERROR), 0, BZ_PRIO_EVENT);
+
+    // Failed attempts during an outage used to vanish without a trace - backfill them
+    // like grants so the dashboard shows what happened at the door while offline.
+    queueOfflineAccessEvent(0, cardUid, fingerprintId, denialReason ? denialReason : "offline_no_match");
+
+    // The server's brute-force lockout can't help while it's unreachable - mirror it
+    // locally, or an outage would allow unlimited guesses at the offline cache.
+    if (++offlineFailCount >= OFFLINE_MAX_FAILED_ATTEMPTS) {
+      offlineFailCount = 0;
+      startLockout(OFFLINE_LOCKOUT_SECONDS);
+    } else {
+      Serial.printf("Offline attempts left before lockout: %d\n", OFFLINE_MAX_FAILED_ATTEMPTS - offlineFailCount);
+    }
   }
 }
 
@@ -1835,7 +1921,8 @@ bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int
 // compact object per line, so appending never needs to parse/rewrite the whole file).
 // Silently drops the event once OFFLINE_QUEUE_MAX_ENTRIES is reached rather than growing
 // flash usage unboundedly if the device stays offline for a long stretch.
-void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
+// denialReason: nullptr = granted; otherwise the event is a denied attempt.
+void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId, const char* denialReason) {
   int queuedCount = 0;
   if (offlineQueuePending) {
     File countFile = LittleFS.open(OFFLINE_QUEUE_PATH, "r");
@@ -1847,7 +1934,10 @@ void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
     }
   }
 
-  if (queuedCount >= OFFLINE_QUEUE_MAX_ENTRIES) {
+  // Denials stop short of the cap, keeping the last slots for grants - otherwise someone
+  // spamming bad attempts during an outage could crowd real entries out of the audit trail.
+  int cap = denialReason ? OFFLINE_QUEUE_MAX_ENTRIES - OFFLINE_QUEUE_GRANT_RESERVE : OFFLINE_QUEUE_MAX_ENTRIES;
+  if (queuedCount >= cap) {
     Serial.println("Offline access queue full - dropping event (will not appear on dashboard).");
     return;
   }
@@ -1865,6 +1955,7 @@ void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
   // When the door actually opened - otherwise the dashboard shows the time the event
   // was backfilled, which can be hours later. 0 if NTP hasn't synced since boot.
   doc["occurred_at"] = (long)currentEpoch();
+  if (denialReason) doc["denial_reason"] = denialReason;
   serializeJson(doc, f);
   f.println();
   f.close();
@@ -1914,11 +2005,14 @@ void flushOfflineQueue() {
 
     JsonDocument payload;
     payload["device_id"] = DEVICE_ID;
-    payload["user_id"] = doc["user_id"] | 0;
+    int queuedUserId = doc["user_id"] | 0;
+    if (queuedUserId > 0) payload["user_id"] = queuedUserId; // denials have no matched user
     payload["card_uid"] = doc["card_uid"] | "";
     payload["fingerprint_id"] = doc["fingerprint_id"] | 0;
     long occurredAt = doc["occurred_at"] | 0L;
     if (occurredAt > 0) payload["occurred_at"] = occurredAt;
+    const char* queuedDenial = doc["denial_reason"] | (const char*)nullptr;
+    if (queuedDenial) payload["denial_reason"] = queuedDenial;
 
     String jsonPayload;
     serializeJson(payload, jsonPayload);

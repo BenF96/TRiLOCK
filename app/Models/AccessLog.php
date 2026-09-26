@@ -22,6 +22,7 @@ class AccessLog extends Model
         'user_inactive'              => 'User account inactive',
         'lockout_active'             => 'Attempt during security lockout',
         'unidentified_capture'       => 'Unlinked camera capture',
+        'offline_no_match'           => 'No match in offline credential cache (server unreachable)',
     ];
 
     /**
@@ -36,6 +37,15 @@ class AccessLog extends Model
         'credential_mismatch',
         'user_inactive',
         'lockout_active',
+    ];
+
+    /**
+     * Reasons an offline-decided denial can be backfilled with (POST /api/access/offline-log):
+     * the on-device checks plus a full combo that matched nothing in the offline cache.
+     */
+    public const OFFLINE_DENIAL_REASONS = [
+        ...self::DEVICE_DENIAL_REASONS,
+        'offline_no_match',
     ];
 
     protected $fillable = [

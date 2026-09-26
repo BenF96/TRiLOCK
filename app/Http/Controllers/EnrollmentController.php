@@ -20,6 +20,16 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 class EnrollmentController extends Controller
 {
+    /**
+     * Worst-case seconds from "step started" until the ESP32's result can arrive: up to
+     * 3s for its next poll, its own on-device wait, and the 8s result POST. The SSE stream
+     * must outlast this - otherwise a slow-but-successful scan showed "Timeout" in the
+     * wizard while the device was still working, and the result landed unseen.
+     */
+    private const PIN_DEVICE_WINDOW         = 60; // 3 + 45s keypad wait + 8
+    private const RFID_DEVICE_WINDOW        = 60; // 3 + 45s card wait + 8
+    private const FINGERPRINT_DEVICE_WINDOW = 90; // 3 + 30s scan + 2s + 10s lift + 30s scan + 8
+
     public function __construct(
         private readonly EnrollmentService     $service,
         private readonly Esp32EnrollmentClient $esp32,
@@ -119,7 +129,7 @@ class EnrollmentController extends Controller
     public function pinStatus(Request $request): StreamedResponse
     {
         $token   = $request->query('session_token', '');
-        $timeout = (int) config('trilock.enrollment_timeout', 60);
+        $timeout = $this->streamTimeout(self::PIN_DEVICE_WINDOW);
 
         return response()->stream(function () use ($token, $timeout) {
             set_time_limit(0);
@@ -217,7 +227,7 @@ class EnrollmentController extends Controller
     public function fingerprintStatus(Request $request): StreamedResponse
     {
         $token   = $request->query('session_token', '');
-        $timeout = (int) config('trilock.enrollment_timeout', 60);
+        $timeout = $this->streamTimeout(self::FINGERPRINT_DEVICE_WINDOW);
 
         return response()->stream(function () use ($token, $timeout) {
             set_time_limit(0);
@@ -300,7 +310,7 @@ class EnrollmentController extends Controller
     public function rfidStatus(Request $request): StreamedResponse
     {
         $token   = $request->query('session_token', '');
-        $timeout = (int) config('trilock.enrollment_timeout', 60);
+        $timeout = $this->streamTimeout(self::RFID_DEVICE_WINDOW);
 
         return response()->stream(function () use ($token, $timeout) {
             set_time_limit(0);
@@ -404,6 +414,11 @@ class EnrollmentController extends Controller
         } catch (\Throwable $e) {
             return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
         }
+    }
+
+    private function streamTimeout(int $deviceWindow): int
+    {
+        return max((int) config('trilock.enrollment_timeout', 60), $deviceWindow);
     }
 
     // -------------------------------------------------------------------------
