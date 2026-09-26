@@ -47,23 +47,37 @@
                     </p>
                 @endif
 
-                <form method="POST" action="{{ route('door.unlock') }}" class="flex items-center gap-2">
-                    @csrf
+                <div class="flex flex-wrap items-center justify-center gap-3">
+                    <form method="POST" action="{{ route('door.unlock') }}" class="flex items-center gap-2">
+                        @csrf
 
-                    @if($mainControllers->count() > 1)
-                        <select name="device_id" required class="glass-input rounded-xl px-3.5 py-2.5 text-xs text-white">
-                            @foreach($mainControllers as $device)
-                                <option value="{{ $device->id }}">{{ $device->device_name }}</option>
-                            @endforeach
-                        </select>
-                    @elseif($mainControllers->count() === 1)
-                        <input type="hidden" name="device_id" value="{{ $mainControllers->first()->id }}">
-                    @endif
+                        @if($mainControllers->count() > 1)
+                            <select name="device_id" required class="glass-input rounded-xl px-3.5 py-2.5 text-xs text-white">
+                                @foreach($mainControllers as $device)
+                                    <option value="{{ $device->id }}">{{ $device->device_name }}</option>
+                                @endforeach
+                            </select>
+                        @elseif($mainControllers->count() === 1)
+                            <input type="hidden" name="device_id" value="{{ $mainControllers->first()->id }}">
+                        @endif
 
-                    <button type="submit" class="px-6 py-3 bg-linear-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-bold text-xs rounded-xl shadow-lg shadow-emerald-500/20 transition transform active:scale-95 flex items-center gap-2 cursor-pointer">
-                        <i class="fa-solid fa-key"></i> Remote Unlock
-                    </button>
-                </form>
+                        <button type="submit" class="px-6 py-3 bg-linear-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-bold text-xs rounded-xl shadow-lg shadow-emerald-500/20 transition transform active:scale-95 flex items-center gap-2 cursor-pointer">
+                            <i class="fa-solid fa-key"></i> Remote Unlock
+                        </button>
+                    </form>
+
+                    <form method="POST" action="{{ route('door.lock') }}" class="flex items-center gap-2">
+                        @csrf
+
+                        @if($mainControllers->count() === 1)
+                            <input type="hidden" name="device_id" value="{{ $mainControllers->first()->id }}">
+                        @endif
+
+                        <button type="submit" class="px-6 py-3 bg-linear-to-r from-slate-700 to-slate-800 hover:from-slate-600 hover:to-slate-700 text-slate-200 hover:text-white font-bold text-xs rounded-xl border border-slate-700 shadow-lg transition transform active:scale-95 flex items-center gap-2 cursor-pointer">
+                            <i class="fa-solid fa-lock"></i> Remote Lock
+                        </button>
+                    </form>
+                </div>
             </div>
         </div>
 

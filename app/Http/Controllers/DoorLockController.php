@@ -92,6 +92,45 @@ class DoorLockController extends Controller
         return back()->with('warning', "Unlock logged, but could not reach the ESP32 hardware: {$signalResult['error']}. Verify the device is online.");
     }
 
+    public function lock(Request $request)
+    {
+        $user = Auth::user();
+
+        $mainControllers = Device::where('device_type', 'esp32_main')->orderBy('device_name')->get();
+
+        $validated = $request->validate([
+            'device_id' => $mainControllers->count() > 1
+                ? 'required|exists:devices,id'
+                : 'nullable|exists:devices,id',
+        ]);
+
+        $device = $mainControllers->count() === 1
+            ? $mainControllers->first()
+            : $mainControllers->firstWhere('id', (int) ($validated['device_id'] ?? 0));
+
+        if ($mainControllers->isNotEmpty() && !$device) {
+            return back()->with('error', 'Select which registered device to lock.');
+        }
+
+        DoorLog::create([
+            'status'    => 'locked',
+            'opened_at' => null,
+            'closed_at' => null,
+            'locked_at' => now(),
+            'remarks'   => $device
+                ? "Remote Manual Lock by Admin {$user->name} ({$device->device_name})"
+                : "Remote Manual Lock by Admin {$user->name}",
+        ]);
+
+        $signalResult = $this->signalEsp32Lock($device);
+
+        if ($signalResult['success']) {
+            return back()->with('success', 'Door locked remotely.');
+        }
+
+        return back()->with('warning', "Lock logged, but could not reach the ESP32 hardware: {$signalResult['error']}. Verify the device is online.");
+    }
+
     // -------------------------------------------------------------------------------------
     // Private: send unlock command to the ESP32 back-channel HTTP server
     // -------------------------------------------------------------------------------------
@@ -136,6 +175,47 @@ class DoorLockController extends Controller
         } catch (\Exception $e) {
             // In cloud deployments, direct LAN push will fail safely while cloud queue succeeds
             Log::info("Cloud remote unlock queued for ESP32: {$e->getMessage()}", ['device_id' => $device->id]);
+        }
+
+        return ['success' => true, 'error' => null, 'queued' => true];
+    }
+
+    /**
+     * POST http://<esp32_ip>:8080/lock
+     *
+     * Returns ['success' => bool, 'error' => string|null]
+     */
+    private function signalEsp32Lock(?Device $device): array
+    {
+        if (!$device) {
+            return ['success' => true, 'error' => null, 'queued' => false];
+        }
+
+        // 1. Queue command, keyed to this specific device, for cloud / NAT-isolated ESP32
+        //    polling via /api/heartbeat.
+        \Illuminate\Support\Facades\Cache::put("trilock_pending_command_{$device->id}", [
+            'command'   => 'lock',
+            'queued_at' => now()->toDateTimeString(),
+        ], 60);
+
+        // 2. Also attempt direct LAN push if this device's IP is reachable
+        if (!$device->ip_address) {
+            return ['success' => true, 'error' => null, 'queued' => true];
+        }
+
+        $url = "http://{$device->ip_address}:8080/lock";
+
+        try {
+            $response = Http::timeout(2)->post($url);
+
+            if ($response->successful()) {
+                Log::info("ESP32 direct lock signal sent successfully to {$url}", [
+                    'device_id' => $device->id,
+                ]);
+                return ['success' => true, 'error' => null];
+            }
+        } catch (\Exception $e) {
+            Log::info("Cloud remote lock queued for ESP32: {$e->getMessage()}", ['device_id' => $device->id]);
         }
 
         return ['success' => true, 'error' => null, 'queued' => true];

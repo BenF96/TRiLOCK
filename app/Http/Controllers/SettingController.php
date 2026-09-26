@@ -38,6 +38,8 @@ class SettingController extends Controller
             'lab_name'             => $validated['lab_name'],
         ]);
 
+        UserController::notifyDevicesToSync();
+
         return back()->with('success', 'TRILOCK System Settings updated successfully.');
     }
 

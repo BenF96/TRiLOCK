@@ -37,6 +37,8 @@ class PinController extends Controller
             'assigned_at'  => now(),
         ]);
 
+        UserController::notifyDevicesToSync();
+
         $user = User::find($validated['user_id']);
         return back()->with('success', "PIN assigned to {$user->full_name} successfully.");
     }

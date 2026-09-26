@@ -43,6 +43,8 @@ class FingerprintController extends Controller
             'registered_at' => now(),
         ]);
 
+        UserController::notifyDevicesToSync();
+
         return back()->with('success', 'Fingerprint enrolled successfully.');
     }
 

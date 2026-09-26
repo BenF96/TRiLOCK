@@ -1094,7 +1094,7 @@ void pollEnrollmentCommand() {
   int code = http.GET();
   if (code == 200) {
     String response = http.getString();
-    StaticJsonDocument<256> doc;
+    JsonDocument doc;
     deserializeJson(doc, response);
 
     const char* status = doc["status"];
@@ -1290,7 +1290,7 @@ void sendEnrollmentResult(String type, String token, String status, String value
   http.addHeader("Accept", "application/json");
   http.addHeader("Content-Type", "application/json");
 
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["session_token"] = token;
   doc["status"]        = status;
   if (type == "pin")         doc["pin"]            = valueStr;
@@ -1405,6 +1405,7 @@ void checkRemoteUnlockServer() {
 
 
   bool isUnlockRequest = requestLine.startsWith("POST /unlock");
+  bool isLockRequest   = requestLine.startsWith("POST /lock");
   String httpResponse;
 
   if (isUnlockRequest) {
@@ -1413,6 +1414,12 @@ void checkRemoteUnlockServer() {
     Serial.println("Remote unlock executed - relocks when the door closes");
     httpResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
                    "{\"status\":\"unlocked\"}";
+  } else if (isLockRequest) {
+    lockDoor("Remote lock command executed");
+    buzzerPlay(SND_REMOTE, NOTE_COUNT(SND_REMOTE), 0, BZ_PRIO_EVENT);
+    Serial.println("Remote lock executed");
+    httpResponse = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                   "{\"status\":\"locked\"}";
   } else {
     httpResponse = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
                    "{\"status\":\"error\",\"message\":\"Unknown command\"}";
@@ -1468,7 +1475,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     http.addHeader("Accept", "application/json");
     http.addHeader("Content-Type", "application/json");
 
-    StaticJsonDocument<256> doc;
+    JsonDocument doc;
     doc["auth_method"] = method;
     doc["access_type"] = accessType;
     if (cardUid.length() > 0) doc["card_uid"] = cardUid;
@@ -1486,7 +1493,7 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
   }
 
   if (httpResponseCode > 0) {
-    StaticJsonDocument<512> responseDoc;
+    JsonDocument responseDoc;
     deserializeJson(responseDoc, response);
 
     const char* status = responseDoc["status"];
@@ -1614,12 +1621,12 @@ std::vector<int> readCachedFingerprintIds(const char* path) {
   File f = LittleFS.open(path, "r");
   if (!f) return ids;
 
-  DynamicJsonDocument doc(OFFLINE_CACHE_DOC_SIZE);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, f);
   f.close();
   if (err) return ids;
 
-  if (doc.containsKey("active_fingerprint_ids")) {
+  if (doc["active_fingerprint_ids"].is<JsonArray>()) {
     JsonArray activeIds = doc["active_fingerprint_ids"].as<JsonArray>();
     for (int fp : activeIds) {
       if (fp > 0) ids.push_back(fp);
@@ -1698,7 +1705,7 @@ bool attemptOfflineUnlock(String cardUid, int fingerprintId, String pinCode, int
   File f = LittleFS.open(OFFLINE_CACHE_PATH, "r");
   if (!f) return false;
 
-  DynamicJsonDocument doc(OFFLINE_CACHE_DOC_SIZE);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, f);
   f.close();
   if (err) {
@@ -1751,7 +1758,7 @@ void queueOfflineAccessEvent(int userId, String cardUid, int fingerprintId) {
     return;
   }
 
-  StaticJsonDocument<192> doc;
+  JsonDocument doc;
   doc["user_id"] = userId;
   doc["card_uid"] = cardUid;
   doc["fingerprint_id"] = fingerprintId;
@@ -1789,7 +1796,7 @@ void flushOfflineQueue() {
 
   size_t sentCount = 0;
   for (; sentCount < lines.size(); sentCount++) {
-    StaticJsonDocument<192> doc;
+    JsonDocument doc;
     if (deserializeJson(doc, lines[sentCount])) continue; // corrupt line - skip, don't block the rest
 
     HTTPClient http;
@@ -1799,7 +1806,7 @@ void flushOfflineQueue() {
     http.addHeader("Accept", "application/json");
     http.addHeader("Content-Type", "application/json");
 
-    StaticJsonDocument<192> payload;
+    JsonDocument payload;
     payload["device_id"] = DEVICE_ID;
     payload["user_id"] = doc["user_id"] | 0;
     payload["card_uid"] = doc["card_uid"] | "";
@@ -1875,7 +1882,7 @@ void fetchServerSettings() {
   int httpResponseCode = http.GET();
   if (httpResponseCode == 200) {
     String response = http.getString();
-    StaticJsonDocument<512> doc;
+    JsonDocument doc;
     deserializeJson(doc, response);
 
     bool buzzerEnabled = doc["data"]["buzzer_enabled"] | true;
@@ -1913,7 +1920,7 @@ void sendDoorStatusUpdate(String status, String remarks) {
   http.addHeader("Accept", "application/json");
   http.addHeader("Content-Type", "application/json");
 
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["status"]    = status;
   doc["remarks"]   = remarks;
   doc["device_id"] = DEVICE_ID;
@@ -1942,7 +1949,7 @@ void sendHeartbeat() {
   http.addHeader("Accept", "application/json");
   http.addHeader("Content-Type", "application/json");
 
-  StaticJsonDocument<128> doc;
+  JsonDocument doc;
   doc["device_id"] = DEVICE_ID;
   doc["ip_address"] = WiFi.localIP().toString();
 
@@ -1952,7 +1959,7 @@ void sendHeartbeat() {
   int code = http.POST(jsonPayload);
   if (code == 200) {
     String response = http.getString();
-    StaticJsonDocument<512> respDoc;
+    JsonDocument respDoc;
     deserializeJson(respDoc, response);
 
     const char* pendingCmd = respDoc["pending_command"];
@@ -1965,17 +1972,18 @@ void sendHeartbeat() {
       lockDoor("Door locked by remote command");
     } else if (pendingCmd && (String(pendingCmd) == "sync_offline" || String(pendingCmd) == "delete_fingerprint")) {
       Serial.println(">>> CLOUD SYNC/DELETE CREDENTIAL COMMAND RECEIVED!");
-      if (respDoc.containsKey("deleted_fingerprint_ids")) {
+      if (respDoc["deleted_fingerprint_ids"].is<JsonArray>()) {
         JsonArray delArr = respDoc["deleted_fingerprint_ids"].as<JsonArray>();
         for (int delId : delArr) {
           deleteFingerprintFromSensor(delId);
         }
       }
-      if (respDoc.containsKey("fingerprint_id")) {
+      if (respDoc["fingerprint_id"].is<int>()) {
         int delId = respDoc["fingerprint_id"] | 0;
         deleteFingerprintFromSensor(delId);
       }
       syncOfflineCache();
+      fetchServerSettings();
     }
     Serial.println("Heartbeat synchronized with Cloud Server (HTTP 200)");
   } else if (code > 0) {

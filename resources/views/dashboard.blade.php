@@ -122,13 +122,21 @@
                 </p>
             </div>
 
-            <!-- Remote Door Unlock Action Controls -->
+            <!-- Remote Door Action Controls -->
             <div class="flex items-center gap-3 shrink-0">
                 <form method="POST" action="{{ route('door.unlock') }}">
                     @csrf
                     <button type="submit" class="px-6 py-3.5 rounded-2xl bg-linear-to-r from-emerald-500 via-teal-500 to-emerald-600 hover:from-emerald-400 hover:to-teal-400 text-white font-bold text-sm shadow-xl shadow-emerald-500/25 transition transform active:scale-95 flex items-center gap-2.5 cursor-pointer">
                         <i class="fa-solid fa-key text-base"></i>
                         <span>Remote Unlock</span>
+                    </button>
+                </form>
+
+                <form method="POST" action="{{ route('door.lock') }}">
+                    @csrf
+                    <button type="submit" class="px-6 py-3.5 rounded-2xl bg-linear-to-r from-slate-700 via-slate-800 to-slate-900 hover:from-slate-600 hover:to-slate-700 text-slate-200 hover:text-white font-bold text-sm border border-slate-700 shadow-xl transition transform active:scale-95 flex items-center gap-2.5 cursor-pointer">
+                        <i class="fa-solid fa-lock text-base"></i>
+                        <span>Remote Lock</span>
                     </button>
                 </form>
             </div>

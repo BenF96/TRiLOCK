@@ -191,4 +191,50 @@ class CameraAndDoorTest extends TestCase
                 'pending_command' => null,
             ]);
     }
+
+    public function test_admin_remote_lock_action()
+    {
+        $admin = User::first();
+
+        $response = $this->actingAs($admin)
+            ->post('/door/lock');
+
+        $response->assertSessionHasNoErrors();
+        $this->assertDatabaseHas('door_logs', [
+            'status' => 'locked',
+        ]);
+    }
+
+    public function test_cloud_remote_lock_command_queued_and_delivered_via_heartbeat()
+    {
+        $admin = User::first();
+        $mainDevice = Device::where('device_type', 'esp32_main')->first();
+
+        // 1. Admin triggers lock on web portal
+        $this->actingAs($admin)->post('/door/lock', [
+            'device_id' => $mainDevice->id,
+        ]);
+
+        // 2. ESP32 sends periodic heartbeat to cloud server
+        $heartbeatResponse = $this->postJson('/api/heartbeat', [
+            'device_id' => $mainDevice->id,
+        ]);
+
+        $heartbeatResponse->assertStatus(200)
+            ->assertJson([
+                'status'          => 'ok',
+                'pending_command' => 'lock',
+            ]);
+
+        // 3. Next heartbeat has no pending command (it was consumed)
+        $secondHeartbeat = $this->postJson('/api/heartbeat', [
+            'device_id' => $mainDevice->id,
+        ]);
+
+        $secondHeartbeat->assertStatus(200)
+            ->assertJson([
+                'status'          => 'ok',
+                'pending_command' => null,
+            ]);
+    }
 }

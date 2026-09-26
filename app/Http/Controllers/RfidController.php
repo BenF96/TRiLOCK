@@ -48,6 +48,8 @@ class RfidController extends Controller
             'assigned_at' => $validated['user_id'] ? now() : null,
         ]);
 
+        UserController::notifyDevicesToSync();
+
         return back()->with('success', 'RFID Card registered successfully.');
     }
 
@@ -68,6 +70,8 @@ class RfidController extends Controller
             'assigned_at' => now(),
         ]);
 
+        UserController::notifyDevicesToSync();
+
         return back()->with('success', 'RFID Card assigned to user.');
     }
 
@@ -75,6 +79,8 @@ class RfidController extends Controller
     {
         $card->status = ($card->status === 'active') ? 'disabled' : 'active';
         $card->save();
+
+        UserController::notifyDevicesToSync();
 
         return back()->with('success', "Card {$card->card_uid} status updated to {$card->status}.");
     }

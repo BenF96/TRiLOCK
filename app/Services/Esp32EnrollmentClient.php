@@ -20,9 +20,29 @@ class Esp32EnrollmentClient
 
     public function __construct()
     {
-        // The ESP32 IP is read from config at runtime so it can be changed in Settings
-        $this->baseUrl = rtrim(config('trilock.esp32_url', 'http://192.168.1.106'), '/');
+        $this->baseUrl = $this->getBaseUrl();
         $this->timeout = (int) config('trilock.enrollment_timeout', 60);
+    }
+
+    public function getBaseUrl(?int $deviceId = null): string
+    {
+        if ($deviceId) {
+            $device = \App\Models\Device::find($deviceId);
+            if ($device && !empty($device->ip_address)) {
+                return "http://{$device->ip_address}:8080";
+            }
+        }
+
+        $mainDevice = \App\Models\Device::where('device_type', 'esp32_main')
+            ->whereNotNull('ip_address')
+            ->orderByDesc('last_seen')
+            ->first();
+
+        if ($mainDevice && !empty($mainDevice->ip_address)) {
+            return "http://{$mainDevice->ip_address}:8080";
+        }
+
+        return rtrim(config('trilock.esp32_url', 'http://192.168.1.106'), '/');
     }
 
     // -------------------------------------------------------------------------
@@ -35,7 +55,7 @@ class Esp32EnrollmentClient
     public function isOnline(): bool
     {
         try {
-            $response = Http::timeout(5)->get("{$this->baseUrl}/api/status");
+            $response = Http::timeout(5)->get("{$this->getBaseUrl()}/api/status");
             return $response->successful();
         } catch (\Throwable) {
             return false;

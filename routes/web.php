@@ -104,6 +104,7 @@ Route::middleware(['auth', 'admin'])->group(function () {
     // Door Lock Management
     Route::get('/door', [DoorLockController::class, 'index'])->name('door.index');
     Route::post('/door/unlock', [DoorLockController::class, 'unlock'])->name('door.unlock');
+    Route::post('/door/lock',   [DoorLockController::class, 'lock'])->name('door.lock');
 
     // Access Logs
     Route::get('/access-logs', [AccessLogController::class, 'index'])->name('logs.index');

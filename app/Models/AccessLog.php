@@ -26,10 +26,16 @@ class AccessLog extends Model
 
     /**
      * Reasons the ESP32 is allowed to report itself for rejections it decides locally
-     * (e.g. the fingerprint sensor finds no matching template, so there's no ID to send).
+     * (e.g. the fingerprint sensor finds no matching template, or an RFID/PIN check fails).
      */
     public const DEVICE_DENIAL_REASONS = [
+        'missing_factors',
+        'rfid_not_recognized',
         'fingerprint_not_recognized',
+        'pin_incorrect',
+        'credential_mismatch',
+        'user_inactive',
+        'lockout_active',
     ];
 
     protected $fillable = [
