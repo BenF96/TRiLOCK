@@ -316,7 +316,9 @@ bool keyBlinkActive = false;
 #define MOSI_PIN        23  // MFRC522 SPI MOSI
 #define MISO_PIN        19  // MFRC522 SPI MISO
 #define RST_PIN         4   // MFRC522 RFID Reset Pin
-#define RELAY_PIN       13  // Solenoid Lock Relay Control Pin (Active LOW/HIGH)
+#define RELAY_PIN       13  // Solenoid Lock Relay Control Pin (active LOW relay module)
+#define RELAY_ENERGIZE  LOW   // level that energizes the solenoid (unlocked)
+#define RELAY_RELEASE   HIGH  // level that releases the solenoid (locked)
 #define BUZZER_PIN      15  // Piezo Buzzer Pin
 // Was GPIO2 - that's SS_PIN above (MFRC522 chip-select). Sharing it with the LED meant
 // every digitalWrite(LED_GREEN, ...) toggled the RFID reader's SPI CS line as a side
@@ -719,8 +721,10 @@ void setup() {
   Serial.printf("Boot - reset reason: %d\n", (int)esp_reset_reason());
 
   // Initialize GPIO Pins
+  // Latch the locked level before switching to OUTPUT so the active-LOW relay
+  // doesn't click on (unlock) for a moment at boot
+  digitalWrite(RELAY_PIN, RELAY_RELEASE); // Solenoid Locked (De-energized)
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW); // Solenoid Locked (De-energized)
 
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_RED, OUTPUT);
@@ -976,7 +980,7 @@ void unlockDoor() {
   // Already standing open (e.g. remote unlock while propped) - the next close relocks
   doorOpenedSinceUnlock = !doorClosed;
 
-  digitalWrite(RELAY_PIN, HIGH); // Energize Solenoid
+  digitalWrite(RELAY_PIN, RELAY_ENERGIZE); // Energize Solenoid
   digitalWrite(LED_GREEN, HIGH);
   digitalWrite(LED_RED, LOW);
   ledRedActive = false;
@@ -992,7 +996,7 @@ void unlockDoor() {
 void lockDoor(const char* remarks) {
   isDoorUnlocked = false;
   doorOpenedSinceUnlock = false;
-  digitalWrite(RELAY_PIN, LOW); // De-energize Solenoid
+  digitalWrite(RELAY_PIN, RELAY_RELEASE); // De-energize Solenoid
   digitalWrite(LED_GREEN, LOW);
   digitalWrite(LED_RED, LOW);
 
@@ -1249,7 +1253,7 @@ void onKeypadEvent(char key) {
   }
 
   Serial.println("* held - restarting controller...");
-  digitalWrite(RELAY_PIN, LOW); // make sure the solenoid is released before reset
+  digitalWrite(RELAY_PIN, RELAY_RELEASE); // make sure the solenoid is released before reset
   buzzerPlayNow(SND_RESTART, NOTE_COUNT(SND_RESTART));
   delay(100);
   ESP.restart();
