@@ -85,7 +85,17 @@
                     @endif
                     <div class="flex items-center justify-between text-xs text-slate-400 font-mono">
                         <span class="text-slate-300">{{ $capture->date }}</span>
-                        <span class="text-cyan-400 font-bold">{{ $capture->time }}</span>
+                        <div class="flex items-center gap-2">
+                            <span class="text-cyan-400 font-bold">{{ $capture->time }}</span>
+                            <form method="POST" action="{{ route('camera.destroy', $capture) }}"
+                                  onsubmit="return confirm('Delete this camera capture permanently?')">
+                                @csrf @method('DELETE')
+                                <button type="submit" title="Delete capture"
+                                        class="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-rose-400 hover:border-rose-500/40 transition cursor-pointer">
+                                    <i class="fa-solid fa-trash text-[11px]"></i>
+                                </button>
+                            </form>
+                        </div>
                     </div>
                 </div>
 

@@ -66,7 +66,7 @@
                 </div>
                 <div>
                     <h3 class="text-base font-bold text-white tracking-tight">Audit Trail Database</h3>
-                    <p class="text-xs text-slate-400 font-mono">Immutable cryptographic record of entry events</p>
+                    <p class="text-xs text-slate-400 font-mono">Record of entry events</p>
                 </div>
             </div>
         </div>
@@ -82,6 +82,7 @@
                         <th class="py-3 px-3">ESP32-CAM Snap</th>
                         <th class="py-3 px-3">Timestamp</th>
                         <th class="py-3 px-3">Solenoid State</th>
+                        <th class="py-3 px-3 text-right">Actions</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-800/50 font-medium">
@@ -154,10 +155,20 @@
                                     {{ ucfirst($log->door_status) }}
                                 </span>
                             </td>
+                            <td class="py-3.5 px-3 text-right">
+                                <form method="POST" action="{{ route('logs.destroy', $log) }}" class="inline"
+                                      onsubmit="return confirm('Delete audit log #{{ $log->id }} permanently?')">
+                                    @csrf @method('DELETE')
+                                    <button type="submit" title="Delete log"
+                                            class="p-2 rounded-xl bg-slate-900 border border-slate-800 text-slate-400 hover:text-rose-400 hover:border-rose-500/40 text-xs transition cursor-pointer">
+                                        <i class="fa-solid fa-trash"></i>
+                                    </button>
+                                </form>
+                            </td>
                         </tr>
                     @empty
                         <tr>
-                            <td colspan="7" class="py-12 text-center text-slate-500">
+                            <td colspan="8" class="py-12 text-center text-slate-500">
                                 <i class="fa-solid fa-inbox text-3xl mb-2 text-slate-600 block"></i>
                                 No access audit records found matching filters.
                             </td>

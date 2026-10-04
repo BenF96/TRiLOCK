@@ -96,4 +96,22 @@ class AccessLog extends Model
 
         return \Illuminate\Support\Facades\Storage::url($this->captured_image);
     }
+
+    /**
+     * Remove the stored ESP32-CAM capture file: Supabase Storage for public URLs,
+     * otherwise the local disk the upload fell back to.
+     */
+    public function deleteCapturedImageFile(): void
+    {
+        if (!$this->captured_image) {
+            return;
+        }
+
+        if (str_starts_with($this->captured_image, 'http://') || str_starts_with($this->captured_image, 'https://')) {
+            app(\App\Services\SupabaseStorageService::class)->delete($this->captured_image);
+            return;
+        }
+
+        \Illuminate\Support\Facades\Storage::delete($this->captured_image);
+    }
 }

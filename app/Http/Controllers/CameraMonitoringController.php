@@ -33,4 +33,19 @@ class CameraMonitoringController extends Controller
 
         return view('camera.index', compact('captures'));
     }
+
+    public function destroy(AccessLog $log)
+    {
+        $log->deleteCapturedImageFile();
+
+        // A standalone capture exists only to hold the photo, so drop the whole record;
+        // a real access event keeps its audit entry and just loses the snapshot.
+        if ($log->denial_reason === 'unidentified_capture') {
+            $log->delete();
+        } else {
+            $log->update(['captured_image' => null]);
+        }
+
+        return back()->with('success', 'Camera capture deleted.');
+    }
 }

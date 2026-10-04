@@ -41,4 +41,12 @@ class AccessLogController extends Controller
 
         return view('logs.index', compact('logs'));
     }
+
+    public function destroy(AccessLog $log)
+    {
+        $log->deleteCapturedImageFile();
+        $log->delete();
+
+        return back()->with('success', "Audit log #{$log->id} deleted.");
+    }
 }
