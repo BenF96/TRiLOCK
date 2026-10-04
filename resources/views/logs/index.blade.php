@@ -69,6 +69,22 @@
                     <p class="text-xs text-slate-400 font-mono">Record of entry events</p>
                 </div>
             </div>
+
+            @if($logs->total() > 0)
+                @php $filtered = request()->anyFilled(['search', 'access_type', 'auth_method', 'date_from', 'date_to']); @endphp
+                <form method="POST" action="{{ route('logs.destroy-all') }}"
+                      onsubmit="return confirm('Permanently delete {{ $logs->total() }} {{ $filtered ? 'filtered' : '' }} audit log(s) and their camera snapshots? This cannot be undone.')">
+                    @csrf @method('DELETE')
+                    @foreach(request()->only(['search', 'access_type', 'auth_method', 'date_from', 'date_to']) as $name => $value)
+                        <input type="hidden" name="{{ $name }}" value="{{ $value }}">
+                    @endforeach
+                    <button type="submit"
+                            class="px-3.5 py-2 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 hover:bg-rose-500/20 hover:text-rose-200 text-xs font-bold transition cursor-pointer flex items-center gap-2">
+                        <i class="fa-solid fa-trash"></i>
+                        {{ $filtered ? 'Delete Filtered' : 'Delete All' }} ({{ $logs->total() }})
+                    </button>
+                </form>
+            @endif
         </div>
 
         <div class="overflow-x-auto">

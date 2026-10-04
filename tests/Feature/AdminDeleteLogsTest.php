@@ -91,6 +91,93 @@ class AdminDeleteLogsTest extends TestCase
             && $request->url() === 'https://proj.supabase.co/storage/v1/object/captures/2026-10-04/snap.jpg');
     }
 
+    public function test_delete_all_logs_without_filters_clears_everything()
+    {
+        Storage::put('captures/a.jpg', 'jpeg');
+        $this->makeLog(['captured_image' => 'captures/a.jpg']);
+        $this->makeLog(['access_type' => 'denied']);
+
+        $this->actingAs($this->admin)->delete('/access-logs')
+            ->assertRedirect(route('logs.index'))
+            ->assertSessionHas('success');
+
+        $this->assertSame(0, AccessLog::count());
+        Storage::assertMissing('captures/a.jpg');
+    }
+
+    public function test_delete_all_logs_only_removes_rows_matching_filters()
+    {
+        AccessLog::query()->delete();
+        $entry = $this->makeLog(['access_type' => 'entry']);
+        $denied = $this->makeLog(['access_type' => 'denied']);
+
+        $this->actingAs($this->admin)->delete('/access-logs', ['access_type' => 'denied']);
+
+        $this->assertDatabaseHas('access_logs', ['id' => $entry->id]);
+        $this->assertDatabaseMissing('access_logs', ['id' => $denied->id]);
+    }
+
+    public function test_delete_all_captures_keeps_linked_events_and_drops_standalone_ones()
+    {
+        AccessLog::query()->delete();
+        Storage::put('captures/a.jpg', 'jpeg');
+        $linked = $this->makeLog(['captured_image' => 'captures/a.jpg']);
+        $standalone = $this->makeLog([
+            'user_id'               => null,
+            'authentication_method' => 'unauthorized',
+            'access_type'           => 'denied',
+            'denial_reason'         => 'unidentified_capture',
+            'captured_image'        => 'captures/b.jpg',
+        ]);
+        $noPhoto = $this->makeLog();
+
+        $this->actingAs($this->admin)->delete('/camera')->assertRedirect(route('camera.index'));
+
+        $this->assertNull($linked->fresh()->captured_image);
+        $this->assertDatabaseMissing('access_logs', ['id' => $standalone->id]);
+        $this->assertDatabaseHas('access_logs', ['id' => $noPhoto->id]);
+        Storage::assertMissing('captures/a.jpg');
+    }
+
+    public function test_delete_all_supabase_captures_uses_one_bulk_request()
+    {
+        config([
+            'services.supabase.url'              => 'https://proj.supabase.co',
+            'services.supabase.service_role_key' => 'key',
+        ]);
+        Http::fake(['*' => Http::response([], 200)]);
+        AccessLog::query()->delete();
+        $prefix = 'https://proj.supabase.co/storage/v1/object/public/captures/';
+        $this->makeLog(['captured_image' => $prefix . 'x.jpg']);
+        $this->makeLog(['captured_image' => $prefix . 'y.jpg']);
+
+        $this->actingAs($this->admin)->delete('/camera');
+
+        Http::assertSentCount(1);
+        Http::assertSent(fn ($request) => $request->method() === 'DELETE'
+            && $request->url() === 'https://proj.supabase.co/storage/v1/object/captures'
+            && collect($request['prefixes'])->sort()->values()->all() === ['x.jpg', 'y.jpg']);
+    }
+
+    public function test_pages_show_delete_all_buttons()
+    {
+        $this->makeLog(['captured_image' => 'captures/a.jpg']);
+
+        $this->actingAs($this->admin)->get('/access-logs')->assertOk()->assertSee('Delete All');
+        $this->actingAs($this->admin)->get('/access-logs?access_type=entry')->assertOk()->assertSee('Delete Filtered');
+        $this->actingAs($this->admin)->get('/camera')->assertOk()->assertSee('Delete All');
+    }
+
+    public function test_non_admin_cannot_delete_all_logs()
+    {
+        $student = User::factory()->create(['role' => 'student', 'status' => 'active']);
+        $log = $this->makeLog();
+
+        $this->actingAs($student)->delete('/access-logs')->assertRedirect(route('login'));
+
+        $this->assertDatabaseHas('access_logs', ['id' => $log->id]);
+    }
+
     public function test_non_admin_cannot_delete_logs()
     {
         $student = User::factory()->create(['role' => 'student', 'status' => 'active']);

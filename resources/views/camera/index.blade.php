@@ -35,6 +35,22 @@
             <span class="w-2 h-2 rounded-full bg-amber-400 pulse-online"></span>
             <span>ESP32-CAM Sensor: <strong class="text-white">OV2640 (640x480 VGA)</strong></span>
         </div>
+
+        @if($captures->total() > 0)
+            @php $filtered = request()->anyFilled(['search', 'access_type', 'date']); @endphp
+            <form method="POST" action="{{ route('camera.destroy-all') }}"
+                  onsubmit="return confirm('Permanently delete {{ $captures->total() }} {{ $filtered ? 'filtered' : '' }} camera capture(s)? This cannot be undone.')">
+                @csrf @method('DELETE')
+                @foreach(request()->only(['search', 'access_type', 'date']) as $name => $value)
+                    <input type="hidden" name="{{ $name }}" value="{{ $value }}">
+                @endforeach
+                <button type="submit"
+                        class="px-3.5 py-2 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 hover:bg-rose-500/20 hover:text-rose-200 text-xs font-bold transition cursor-pointer flex items-center gap-2 whitespace-nowrap">
+                    <i class="fa-solid fa-trash"></i>
+                    {{ $filtered ? 'Delete Filtered' : 'Delete All' }} ({{ $captures->total() }})
+                </button>
+            </form>
+        @endif
     </div>
 
     <!-- Image Gallery Grid -->

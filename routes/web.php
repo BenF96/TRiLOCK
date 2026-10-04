@@ -101,6 +101,7 @@ Route::middleware(['auth', 'admin'])->group(function () {
     // Camera Monitoring & Gallery
     Route::get('/camera', [CameraMonitoringController::class, 'index'])->name('camera.index');
     Route::delete('/camera/{log}', [CameraMonitoringController::class, 'destroy'])->name('camera.destroy');
+    Route::delete('/camera', [CameraMonitoringController::class, 'destroyAll'])->name('camera.destroy-all');
 
     // Door Lock Management
     Route::get('/door', [DoorLockController::class, 'index'])->name('door.index');
@@ -110,6 +111,7 @@ Route::middleware(['auth', 'admin'])->group(function () {
     // Access Logs
     Route::get('/access-logs', [AccessLogController::class, 'index'])->name('logs.index');
     Route::delete('/access-logs/{log}', [AccessLogController::class, 'destroy'])->name('logs.destroy');
+    Route::delete('/access-logs', [AccessLogController::class, 'destroyAll'])->name('logs.destroy-all');
 
     // Reports
     Route::get('/reports', [ReportController::class, 'index'])->name('reports.index');

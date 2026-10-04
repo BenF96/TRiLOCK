@@ -120,4 +120,37 @@ class SupabaseStorageService
 
         return Storage::disk('public')->delete($path);
     }
+
+    /**
+     * Delete several objects in one request (Supabase bulk remove endpoint).
+     */
+    public function deleteMany(array $paths, ?string $bucket = null): bool
+    {
+        if (count($paths) === 1) {
+            return $this->delete($paths[0], $bucket);
+        }
+
+        $bucket = $bucket ?: $this->defaultBucket;
+
+        $publicPrefix = "{$this->url}/storage/v1/object/public/{$bucket}/";
+        $paths = array_map(
+            fn ($path) => str_starts_with($path, $publicPrefix) ? substr($path, strlen($publicPrefix)) : $path,
+            $paths
+        );
+
+        if ($this->isConfigured()) {
+            try {
+                $response = Http::withHeaders([
+                    'Authorization' => "Bearer {$this->serviceRoleKey}",
+                    'apikey'        => $this->serviceRoleKey,
+                ])->delete("{$this->url}/storage/v1/object/{$bucket}", ['prefixes' => array_values($paths)]);
+
+                return $response->successful();
+            } catch (\Throwable $e) {
+                Log::error("Supabase Storage bulk delete failed: " . $e->getMessage());
+            }
+        }
+
+        return Storage::disk('public')->delete($paths);
+    }
 }

@@ -103,15 +103,29 @@ class AccessLog extends Model
      */
     public function deleteCapturedImageFile(): void
     {
-        if (!$this->captured_image) {
+        self::deleteCapturedImageFiles([$this->captured_image]);
+    }
+
+    /**
+     * Bulk version of deleteCapturedImageFile(), batching the Supabase objects
+     * into a single storage request.
+     */
+    public static function deleteCapturedImageFiles(array $images): void
+    {
+        $images = array_filter($images);
+        if (!$images) {
             return;
         }
 
-        if (str_starts_with($this->captured_image, 'http://') || str_starts_with($this->captured_image, 'https://')) {
-            app(\App\Services\SupabaseStorageService::class)->delete($this->captured_image);
-            return;
+        [$urls, $paths] = collect($images)
+            ->partition(fn ($image) => str_starts_with($image, 'http://') || str_starts_with($image, 'https://'));
+
+        if ($urls->isNotEmpty()) {
+            app(\App\Services\SupabaseStorageService::class)->deleteMany($urls->values()->all());
         }
 
-        \Illuminate\Support\Facades\Storage::delete($this->captured_image);
+        if ($paths->isNotEmpty()) {
+            \Illuminate\Support\Facades\Storage::delete($paths->values()->all());
+        }
     }
 }
