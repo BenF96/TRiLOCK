@@ -72,9 +72,9 @@
 // -------------------------------------------------------------------------------------
 void unlockDoor();
 void lockDoor(const char* remarks);
+void releaseSolenoid();
 void denyAccess();
-void startLockout(int seconds);
-bool rejectIfLockedOut();
+void noteUserInput();
 void reportLocalDenial(const char* reason);
 void updateStatusLeds();
 bool isRfidCardPresent();
@@ -109,7 +109,7 @@ void flushOfflineQueue();
 String sha256Hex(String input);
 time_t currentEpoch();
 void fetchServerSettings();
-void sendDoorStatusUpdate(String status, String remarks);
+void sendDoorStatusUpdate(String status, String remarks, time_t at = 0, long openSeconds = -1);
 void addDoorSnapshot(JsonDocument& doc);
 void sendHeartbeat();
 void connectWiFi();
@@ -273,22 +273,19 @@ private:
 
 SettledKeypad keypad(makeKeymap(KEYPAD_KEYS), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
 
-// PIN entry state machine
+// PIN entry state machine. No idle/session timeouts: staged credentials are kept until
+// all three are in, the attempt is decided, or '*' clears them.
 #define PIN_MAX_LEN        8     // Maximum PIN digit count
-#define PIN_ENTRY_TIMEOUT  15000 // ms: clear buffer if idle this long after first keypress
-#define MFA_SESSION_TIMEOUT 30000 // ms: time window to provide all 3 credentials (RFID + FP + PIN)
 #define KEYPAD_RESET_HOLD_MS 5000 // ms: hold '*' this long to restart the controller (tap = clear entry)
 #define KEYPAD_DEBOUNCE_MS   40   // ms: key must read stable this long (see setup())
 
 String  pinBuffer = "";           // Digits entered so far (plain text, in RAM only)
-unsigned long pinLastKeyMs = 0;   // Millis of last keypress (for timeout)
 bool    pinEntryActive = false;   // True while user is mid-entry
 
 // 3-Factor Authentication Session State
 String        currentMfaCardUid     = "";
 int           currentMfaFingerId    = 0;
 String        currentMfaPin         = "";
-unsigned long mfaSessionStartMs     = 0;
 bool          mfaSessionActive      = false;
 
 // Freshly-enrolled fingerprint slot, exempted from purgeRevokedFingerprints()'s orphan
@@ -380,25 +377,16 @@ unsigned long doorChangeTimer = 0;
 unsigned long doorOpenedAt = 0;
 bool doorAjarAlarmActive = false;
 
-// Non-blocking red LED timer (used by denyAccess)
-#define LED_RED_ON_MS 700
-unsigned long ledRedStart = 0;
+// Red LED lit by denyAccess(). No timer - it stays on until the next scan/keypress or
+// an unlock (see noteUserInput()). There's no brute-force lockout either: every attempt
+// is checked, however many failed before it.
 bool ledRedActive = false;
 
-// Brute-force lockout, mirrored from the server's "locked_out" response. While active,
-// the red LED stays on and every scan/keypress is rejected on the spot without a server
-// round-trip (the server would refuse it anyway).
-#define LOCKOUT_REJECT_TONE_GAP_MS 1500 // Don't re-sound the denial tone faster than this
-unsigned long lockoutUntilMs = 0;
-bool lockoutActive = false;
-unsigned long lastLockoutToneMs = 0;
-
-// Local mirror of the server's lockout for when it's unreachable (see the offline
-// fallback in sendAccessRequest()). Same defaults as TRILOCK_MAX_FAILED_ATTEMPTS /
-// TRILOCK_LOCKOUT_DURATION on the server.
-#define OFFLINE_MAX_FAILED_ATTEMPTS 5
-#define OFFLINE_LOCKOUT_SECONDS     60
-int offlineFailCount = 0;
+// Staged credentials never expire, so a half-finished entry someone walked away from
+// would otherwise hold off the background polls in loop() forever (the device would
+// drop offline on the dashboard). Polls are only deferred while input is this recent.
+#define INPUT_ACTIVE_MS 30000
+unsigned long lastInputMs = 0;
 
 // Periodic task timestamps
 unsigned long lastHeartbeatMs = 0;
@@ -884,8 +872,10 @@ void loop() {
   // interval timestamp is only updated once the call actually runs) all of them while
   // someone is actively mid-scan, so a live PIN/RFID/fingerprint entry never gets stalled
   // by a background poll. Each resumes on the very next loop() pass once the interaction
-  // ends (granted, denied, or timed out), not after waiting a full new interval.
-  bool userInteracting = mfaSessionActive || pinEntryActive;
+  // ends (granted, denied, or abandoned for INPUT_ACTIVE_MS), not after waiting a full
+  // new interval.
+  bool userInteracting = (mfaSessionActive || pinEntryActive) &&
+                         millis() - lastInputMs < INPUT_ACTIVE_MS;
 
   // 7. Handle inbound remote unlock commands from the Laravel backend - can block for up
   // to ~3s waiting on the client socket (see checkRemoteUnlockServer()), so it gets the
@@ -994,6 +984,16 @@ void unlockDoor() {
 }
 
 void lockDoor(const char* remarks) {
+  releaseSolenoid();
+
+  // Report the real relock so the dashboard's door status doesn't stay stuck on
+  // "unlocked" until the next access attempt.
+  sendDoorStatusUpdate("locked", remarks);
+}
+
+// Relay + lock state only, no server report - for callers that must re-engage the lock
+// before a blocking HTTP call (see checkDoorSensor()).
+void releaseSolenoid() {
   isDoorUnlocked = false;
   doorOpenedSinceUnlock = false;
   digitalWrite(RELAY_PIN, RELAY_RELEASE); // De-energize Solenoid
@@ -1003,17 +1003,12 @@ void lockDoor(const char* remarks) {
   // Single 1s tone on lock
   buzzerPlay(SND_DOOR_LOCK, NOTE_COUNT(SND_DOOR_LOCK), 0, BZ_PRIO_EVENT);
   Serial.println("DOOR LOCKED");
-
-  // Report the real relock so the dashboard's door status doesn't stay stuck on
-  // "unlocked" until the next access attempt.
-  sendDoorStatusUpdate("locked", remarks);
 }
 
 void denyAccess() {
   digitalWrite(LED_RED, HIGH);
   digitalWrite(LED_GREEN, LOW);
-  ledRedStart  = millis();      // Turned off by updateStatusLeds()
-  ledRedActive = true;
+  ledRedActive = true;          // Turned off by noteUserInput() on the next input
 
   // Beep Error
   buzzerPlay(SND_ACCESS_DENIED, NOTE_COUNT(SND_ACCESS_DENIED), 0, BZ_PRIO_EVENT);
@@ -1027,31 +1022,18 @@ void denyAccess() {
   Serial.println("ACCESS DENIED");
 }
 
-void startLockout(int seconds) {
-  if (seconds <= 0) seconds = 60; // Server always sends it; fall back to its default
-  lockoutActive  = true;
-  lockoutUntilMs = millis() + (unsigned long)seconds * 1000UL;
-  digitalWrite(LED_RED, HIGH);    // Held solid for the whole lockout (see updateStatusLeds())
-  Serial.printf(">>> SECURITY LOCKOUT: rejecting all credentials for %d s <<<\n", seconds);
-}
-
-// Call at the top of each input scanner once it has actually read something. Returns
-// true (and consumes the input) while a lockout is running.
-bool rejectIfLockedOut() {
-  if (!lockoutActive) return false;
-
-  if (millis() - lastLockoutToneMs >= LOCKOUT_REJECT_TONE_GAP_MS) {
-    lastLockoutToneMs = millis();
-    buzzerPlay(SND_ACCESS_DENIED, NOTE_COUNT(SND_ACCESS_DENIED), 0, BZ_PRIO_EVENT);
-    Serial.printf("Input rejected - security lockout active (%lu s left)\n",
-      (lockoutUntilMs - millis()) / 1000UL);
-  }
-  return true;
+// Call at the top of each input scanner once it has actually read something - a new
+// attempt starts, so the previous denial's red LED goes out.
+void noteUserInput() {
+  lastInputMs = millis();
+  if (!ledRedActive) return;
+  digitalWrite(LED_RED, LOW);
+  ledRedActive = false;
 }
 
 // Rejections decided on-device (nothing the server could verify, e.g. a finger with no
 // matching template on the sensor) are still reported so they get logged, photographed
-// and counted toward the brute-force lockout exactly like a server-side denial.
+// and photographed exactly like a server-side denial.
 void reportLocalDenial(const char* reason) {
   Serial.printf("Local denial (%s) - reporting to server...\n", reason);
   sendAccessRequest("local_reject", "entry", currentMfaCardUid, 0, "", reason);
@@ -1059,16 +1041,6 @@ void reportLocalDenial(const char* reason) {
 }
 
 void updateStatusLeds() {
-  if (lockoutActive && (long)(millis() - lockoutUntilMs) >= 0) {
-    lockoutActive = false;
-    digitalWrite(LED_RED, LOW);
-    ledRedActive = false;
-    Serial.println("Security lockout expired - accepting credentials again.");
-  }
-  if (ledRedActive && !lockoutActive && (millis() - ledRedStart >= LED_RED_ON_MS)) {
-    digitalWrite(LED_RED, LOW);
-    ledRedActive = false;
-  }
   // Green blink per keypress (shares the green LED briefly)
   if (keyBlinkActive && (millis() - keyBlinkStart >= KEY_BLINK_MS)) {
     if (!isDoorUnlocked) digitalWrite(LED_GREEN, LOW);
@@ -1083,7 +1055,6 @@ void resetMfaSession() {
   currentMfaCardUid  = "";
   currentMfaFingerId = 0;
   currentMfaPin      = "";
-  mfaSessionStartMs  = 0;
   mfaSessionActive   = false;
 }
 
@@ -1166,11 +1137,10 @@ void checkRfidCard() {
   if (!readRfidCard(cardUid)) {
     return;
   }
-  if (rejectIfLockedOut()) return;
+  noteUserInput();
 
   currentMfaCardUid = cardUid;
   mfaSessionActive = true;
-  if (mfaSessionStartMs == 0) mfaSessionStartMs = millis();
 
   // Chirp + Green LED blink feedback
   digitalWrite(LED_GREEN, HIGH);
@@ -1186,7 +1156,7 @@ void checkRfidCard() {
 void checkFingerprint() {
   // After a rejected scan, wait for the finger to be lifted before reading again -
   // otherwise one finger resting on the sensor would be re-scanned and re-reported every
-  // loop pass, burning through every lockout attempt in about a second.
+  // loop pass, flooding the access log with the same denial.
   static bool awaitingFingerLift = false;
 
   uint8_t p = finger.getImage();
@@ -1195,7 +1165,7 @@ void checkFingerprint() {
     return;
   }
   if (p != FINGERPRINT_OK) return;
-  if (rejectIfLockedOut()) return;
+  noteUserInput();
 
   p = finger.image2Tz();
   if (p != FINGERPRINT_OK) return;
@@ -1205,7 +1175,6 @@ void checkFingerprint() {
     int fingerId = finger.fingerID;
     currentMfaFingerId = fingerId;
     mfaSessionActive = true;
-    if (mfaSessionStartMs == 0) mfaSessionStartMs = millis();
 
     digitalWrite(LED_GREEN, HIGH);
     keyBlinkStart = millis();
@@ -1224,7 +1193,7 @@ void checkFingerprint() {
     awaitingFingerLift = true;
     if (p == FINGERPRINT_NOTFOUND) {
       // An unknown finger can never complete the 3-factor session, so without this it
-      // would never reach the server at all - no log, no photo, no lockout count.
+      // would never reach the server at all - no log, no photo.
       Serial.println("Fingerprint scan: no matching template found (bad placement, wrong finger, or template missing from sensor).");
       reportLocalDenial("fingerprint_not_recognized");
     } else {
@@ -1244,14 +1213,6 @@ void checkFingerprint() {
 void onKeypadEvent(char key) {
   if (key != '*' || keypad.getState() != HOLD) return;
 
-  // The lockout lives in RAM, so a reboot would wipe it - holding '*' must not be a way
-  // to skip a brute-force lockout (the offline one especially, which nothing else keeps).
-  if (lockoutActive) {
-    Serial.println("* held - restart refused during security lockout.");
-    buzzerPlay(SND_ACCESS_DENIED, NOTE_COUNT(SND_ACCESS_DENIED), 0, BZ_PRIO_EVENT);
-    return;
-  }
-
   Serial.println("* held - restarting controller...");
   digitalWrite(RELAY_PIN, RELAY_RELEASE); // make sure the solenoid is released before reset
   buzzerPlayNow(SND_RESTART, NOTE_COUNT(SND_RESTART));
@@ -1261,22 +1222,8 @@ void onKeypadEvent(char key) {
 
 void checkKeypad() {
   char key = keypad.getKey();
-  if (!key) {
-    // Check timeout for idle PIN entry
-    if (pinEntryActive && (millis() - pinLastKeyMs > PIN_ENTRY_TIMEOUT)) {
-      pinBuffer = "";
-      pinEntryActive = false;
-      Serial.println("Keypad entry timeout - buffer cleared.");
-    }
-    // Check timeout for overall Multi-Factor Authentication session
-    if (mfaSessionActive && (millis() - mfaSessionStartMs > MFA_SESSION_TIMEOUT)) {
-      Serial.println("MFA session timed out. Resetting all staged credentials.");
-      resetMfaSession();
-      buzzerPlayNow(SND_ERROR, NOTE_COUNT(SND_ERROR));
-    }
-    return;
-  }
-  if (rejectIfLockedOut()) return;
+  if (!key) return;
+  noteUserInput();
 
   // Key pressed - feedback chirp & LED flash
   digitalWrite(LED_GREEN, HIGH);
@@ -1284,10 +1231,8 @@ void checkKeypad() {
   keyBlinkActive = true;
   buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
 
-  pinLastKeyMs = millis();
   pinEntryActive = true;
   mfaSessionActive = true;
-  if (mfaSessionStartMs == 0) mfaSessionStartMs = millis();
 
   if (key == '#') {
     // Stage PIN into MFA session
@@ -1620,19 +1565,24 @@ void checkDoorSensor() {
       ? "Door limit switch released - door opened"
       : "Door opened while the lock was engaged (exit from inside, override, or forced)");
   } else {
+    time_t closedAt = currentEpoch();
+    long openSeconds = doorOpenedAt ? (long)((millis() - doorOpenedAt) / 1000) : -1;
     doorOpenedAt = 0;
     if (doorAjarAlarmActive) {
       doorAjarAlarmActive = false;
       buzzerStop(); // Silence the door-left-open alarm
       Serial.println("Door Ajar Alarm Cleared.");
     }
-    Serial.println("Door State: CLOSED");
-    sendDoorStatusUpdate("closed", "Door limit switch pressed - door closed");
+    Serial.printf("Door State: CLOSED (open %lds)\n", openSeconds);
 
-    // Person went through and the door swung shut - re-engage the solenoid now
-    if (autoLockEnabled && isDoorUnlocked && doorOpenedSinceUnlock) {
-      lockDoor("Door relocked after it was closed");
-    }
+    // Person went through and the door swung shut - re-engage the solenoid now, BEFORE
+    // the reports below: each can block up to HTTP_TIMEOUT_MS, and relocking after them
+    // left the door shut but unlocked for that long on a slow server.
+    bool relock = autoLockEnabled && isDoorUnlocked && doorOpenedSinceUnlock;
+    if (relock) releaseSolenoid();
+
+    sendDoorStatusUpdate("closed", "Door limit switch pressed - door closed", closedAt, openSeconds);
+    if (relock) sendDoorStatusUpdate("locked", "Door relocked after it was closed", closedAt);
   }
 }
 
@@ -1860,7 +1810,6 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
       }
 
       // 2. Unlock Solenoid Door
-      offlineFailCount = 0;
       unlockDoor();
     } else {
       int accessLogId = responseDoc["access_log_id"] | 0;
@@ -1870,14 +1819,6 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
       // Feedback first - the capture trigger below can block for up to 2s, and the person
       // shouldn't wait on it to hear they were denied.
       denyAccess();
-      offlineFailCount = 0; // the server is answering - it owns the brute-force count
-
-      if (String(status) == "locked_out") {
-        startLockout(responseDoc["lockout_seconds"] | 60);
-      } else {
-        int attemptsLeft = responseDoc["attempts_left"] | -1;
-        if (attemptsLeft >= 0) Serial.printf("Attempts left before lockout: %d\n", attemptsLeft);
-      }
 
       // Denied/security captures only respect the master switch - not "Record Entry
       // Captures", which only concerns successful entries.
@@ -1900,7 +1841,6 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
   int offlineUserId = 0;
   if (method == "multi_factor" && attemptOfflineUnlock(cardUid, fingerprintId, pinCode, offlineUserId)) {
     Serial.println(">>> OFFLINE ACCESS GRANTED (matched local cache) <<<");
-    offlineFailCount = 0;
     buzzerPlayNow(SND_SCAN, NOTE_COUNT(SND_SCAN));
     unlockDoor();
     // No live server round-trip happened, so this event never reached the dashboard and
@@ -1917,15 +1857,6 @@ void sendAccessRequest(String method, String accessType, String cardUid, int fin
     // Failed attempts during an outage used to vanish without a trace - backfill them
     // like grants so the dashboard shows what happened at the door while offline.
     queueOfflineAccessEvent(0, cardUid, fingerprintId, denialReason ? denialReason : "offline_no_match");
-
-    // The server's brute-force lockout can't help while it's unreachable - mirror it
-    // locally, or an outage would allow unlimited guesses at the offline cache.
-    if (++offlineFailCount >= OFFLINE_MAX_FAILED_ATTEMPTS) {
-      offlineFailCount = 0;
-      startLockout(OFFLINE_LOCKOUT_SECONDS);
-    } else {
-      Serial.printf("Offline attempts left before lockout: %d\n", OFFLINE_MAX_FAILED_ATTEMPTS - offlineFailCount);
-    }
   }
 }
 
@@ -2342,7 +2273,9 @@ void addDoorSnapshot(JsonDocument& doc) {
   doc["ajar_alarm"]  = doorAjarAlarmActive;
 }
 
-void sendDoorStatusUpdate(String status, String remarks) {
+// `at` = when it happened (device epoch, default now) - the server logs that rather than
+// when the report arrived. `openSeconds` = how long the door was open, sent with 'closed'.
+void sendDoorStatusUpdate(String status, String remarks, time_t at, long openSeconds) {
   // 'opened'/'closed' come from the door limit switch (checkDoorSensor()),
   // 'left_open' from the ajar alarm (checkDoorAjar()), 'locked' from the solenoid
   // re-engaging (lockDoor()). Was previously hardcoded to only 'opened'/'closed', which
@@ -2363,6 +2296,8 @@ void sendDoorStatusUpdate(String status, String remarks) {
   doc["status"]    = status;
   doc["remarks"]   = remarks;
   doc["device_id"] = DEVICE_ID;
+  doc["occurred_at"] = (long)(at ? at : currentEpoch()); // 0 = no NTP time yet, server uses its own
+  if (openSeconds >= 0) doc["open_seconds"] = openSeconds;
   addDoorSnapshot(doc);
 
   String jsonPayload;

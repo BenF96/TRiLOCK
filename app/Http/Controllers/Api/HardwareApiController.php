@@ -47,10 +47,10 @@ class HardwareApiController extends Controller
      * ESP32 sends RFID uid or Fingerprint ID for authentication.
      *
      * Every rejected attempt - including ones the ESP32 decides locally (auth_method
-     * "local_reject", e.g. a fingerprint with no matching template on the sensor) and
-     * ones arriving during an active lockout - is written to access_logs as 'denied'
-     * with a denial_reason, counts toward the brute-force lockout, and hands back an
-     * access_log_id + camera_ip so the ESP32-CAM can photograph the attempt.
+     * "local_reject", e.g. a fingerprint with no matching template on the sensor) - is
+     * written to access_logs as 'denied' with a denial_reason and hands back an
+     * access_log_id + camera_ip so the ESP32-CAM can photograph the attempt. There is
+     * no lockout: every attempt is checked, however many failed before it.
      */
     public function processAccess(Request $request)
     {
@@ -64,10 +64,7 @@ class HardwareApiController extends Controller
             'denial_reason'  => 'nullable|string|in:' . implode(',', AccessLog::DEVICE_DENIAL_REASONS),
         ]);
 
-        $deviceId   = $validated['device_id'] ?? null;
-        $clientKey  = $deviceId ? "dev_{$deviceId}" : "ip_" . md5($request->ip());
-        $lockoutKey = "trilock_lockout_{$clientKey}";
-        $failKey    = "trilock_failed_{$clientKey}";
+        $deviceId = $validated['device_id'] ?? null;
 
         // Update device heartbeat whenever hardware checks in
         if ($deviceId) {
@@ -84,23 +81,6 @@ class HardwareApiController extends Controller
             ->where('last_seen', '>', now()->subSeconds(Device::ONLINE_THRESHOLD_SECONDS))
             ->orderByDesc('last_seen')
             ->value('ip_address');
-
-        // Check if currently locked out. The attempt is still recorded (and photographed)
-        // - a burst of tries during a lockout is exactly what an admin needs to see.
-        $lockoutUntil = Cache::get($lockoutKey);
-        if ($lockoutUntil && now()->timestamp < $lockoutUntil) {
-            $remaining = $lockoutUntil - now()->timestamp;
-            $log = $this->logDeniedAttempt(null, 'lockout_active', $deviceId);
-
-            return response()->json([
-                'status'          => 'locked_out',
-                'message'         => "Security Lockout: Too many invalid attempts. Try again in {$remaining} seconds.",
-                'reason'          => 'lockout_active',
-                'lockout_seconds' => $remaining,
-                'access_log_id'   => $log->id,
-                'camera_ip'       => $cameraIp,
-            ], 429);
-        }
 
         $settings     = Setting::getSettings();
         $user         = null;
@@ -138,7 +118,7 @@ class HardwareApiController extends Controller
             }
         } elseif ($authMethod === 'local_reject') {
             // The ESP32 already rejected this on-device (nothing it could send us to verify)
-            // - record it, count it toward the lockout, and let the camera capture it.
+            // - record it and let the camera capture it.
             $denialReason = $validated['denial_reason'] ?? 'fingerprint_not_recognized';
             if ($cardUid) {
                 $user = RfidCard::with('user')->where('card_uid', $cardUid)->where('status', 'active')->first()?->user;
@@ -190,9 +170,6 @@ class HardwareApiController extends Controller
                 'device_id'             => $deviceId,
             ]);
 
-            // Clear failed attempts counter upon successful authorized access
-            Cache::forget($failKey);
-
             // The lock unlocks on this 'granted' - reflect it before its next report
             DoorState::markUnlocked($deviceId);
 
@@ -223,52 +200,19 @@ class HardwareApiController extends Controller
         $log         = $this->logDeniedAttempt($user, $denialReason, $deviceId);
         $reasonLabel = AccessLog::DENIAL_REASONS[$denialReason] ?? $denialReason;
 
-        // Increment failed attempts counter (TTL 2 minutes)
-        $maxFails = config('trilock.max_failed_attempts', 5);
-        $lockoutSec = config('trilock.lockout_duration', 60);
-
-        $currentFails = (int) Cache::get($failKey, 0) + 1;
-        Cache::put($failKey, $currentFails, 120);
-
-        if ($currentFails >= $maxFails) {
-            $lockoutTimestamp = now()->addSeconds($lockoutSec)->timestamp;
-            Cache::put($lockoutKey, $lockoutTimestamp, $lockoutSec);
-            Cache::forget($failKey);
-
-            DoorLog::create([
-                'status'    => 'locked',
-                'opened_at' => null,
-                'closed_at' => null,
-                'locked_at' => now(),
-                'remarks'   => "SECURITY ALERT: Excessive failed access attempts ({$currentFails}) from {$clientKey}. Last reason: {$reasonLabel}. Lockout activated for {$lockoutSec}s.",
-            ]);
-
-            Log::warning("TRILOCK: Security lockout triggered for {$clientKey} after {$currentFails} consecutive failures (last: {$denialReason}).");
-
-            return response()->json([
-                'status'          => 'locked_out',
-                'message'         => "Security Lockout: Too many invalid attempts. Device locked for {$lockoutSec} seconds.",
-                'reason'          => $denialReason,
-                'lockout_seconds' => $lockoutSec,
-                'access_log_id'   => $log->id,
-                'camera_ip'       => $cameraIp,
-            ], 429);
-        }
-
         DoorLog::create([
             'status'    => 'locked',
             'opened_at' => null,
             'closed_at' => null,
             'locked_at' => now(),
-            'remarks'   => "ESP32 API: ACCESS DENIED - {$reasonLabel} via {$authMethod} (Attempt {$currentFails}/{$maxFails})",
+            'remarks'   => "ESP32 API: ACCESS DENIED - {$reasonLabel} via {$authMethod}",
         ]);
 
         return response()->json([
             'status'        => 'denied',
-            'message'       => "Access Denied: {$reasonLabel} (Attempt {$currentFails}/{$maxFails})",
+            'message'       => "Access Denied: {$reasonLabel}",
             'reason'        => $denialReason,
             'access_log_id' => $log->id,
-            'attempts_left' => max(0, $maxFails - $currentFails),
             'camera_ip'     => $cameraIp,
         ], 403);
     }
@@ -300,17 +244,9 @@ class HardwareApiController extends Controller
 
         $this->touchDevice($validated['device_id']);
 
-        // When the door actually opened (device's NTP clock, Unix epoch), not when the
-        // backfill arrived - which can be hours later. Ignored if the device had no valid
-        // time yet (sends 0/omits it) or the value is implausible.
-        $occurredAt = now();
-        if (!empty($validated['occurred_at'])) {
-            $ts = \Illuminate\Support\Carbon::createFromTimestamp($validated['occurred_at'])
-                ->setTimezone(config('app.timezone'));
-            if ($ts->between(now()->subDays(30), now()->addMinutes(5))) {
-                $occurredAt = $ts;
-            }
-        }
+        // When the door actually opened, not when the backfill arrived - which can be
+        // hours later.
+        $occurredAt = $this->deviceTime($validated['occurred_at'] ?? null);
 
         // Failed attempts made while the server was unreachable - recorded so an outage
         // doesn't hide what happened at the door. Attributed to the card's owner, if any,
@@ -447,6 +383,8 @@ class HardwareApiController extends Controller
             'status'    => 'required|string|in:opened,closed,locked,left_open',
             'remarks'   => 'nullable|string',
             'device_id' => 'nullable|integer',
+            'occurred_at'  => 'nullable|integer',
+            'open_seconds' => 'nullable|integer|min:0',
             ...self::DOOR_SNAPSHOT_RULES,
         ]);
 
@@ -460,12 +398,26 @@ class HardwareApiController extends Controller
             $this->recordDoorSnapshot($deviceId, $validated);
         }
 
+        // The device's own clock for the event - a 'locked' report can arrive several
+        // seconds after the relock, queued behind the 'closed' report.
+        $at      = $this->deviceTime($validated['occurred_at'] ?? null);
+        $status  = $validated['status'];
+        $remarks = $validated['remarks'] ?? "ESP32 door status event: {$status}";
+
+        // A close carries how long the door stood open, so its row holds the whole
+        // open -> close cycle.
+        $openedAt = $status === 'opened' ? $at : null;
+        if ($status === 'closed' && isset($validated['open_seconds'])) {
+            $openedAt = $at->copy()->subSeconds($validated['open_seconds']);
+            $remarks .= " (open {$validated['open_seconds']}s)";
+        }
+
         $doorLog = DoorLog::create([
-            'status'    => $validated['status'],
-            'opened_at' => $validated['status'] === 'opened' ? now() : null,
-            'closed_at' => $validated['status'] === 'closed' ? now() : null,
-            'locked_at' => $validated['status'] === 'locked' ? now() : null,
-            'remarks'   => $validated['remarks'] ?? "ESP32 door status event: {$validated['status']}",
+            'status'    => $status,
+            'opened_at' => $openedAt,
+            'closed_at' => $status === 'closed' ? $at : null,
+            'locked_at' => $status === 'locked' ? $at : null,
+            'remarks'   => $remarks,
         ]);
 
         return response()->json([
@@ -623,6 +575,23 @@ class HardwareApiController extends Controller
         'lock'        => 'nullable|string|in:locked,unlocked',
         'ajar_alarm'  => 'nullable|boolean',
     ];
+
+    /**
+     * An event time from the device's NTP clock (Unix epoch). Falls back to now if the
+     * device had no valid time yet (sends 0/omits it) or the value is implausible.
+     */
+    private function deviceTime(?int $epoch): \Illuminate\Support\Carbon
+    {
+        if ($epoch) {
+            $ts = \Illuminate\Support\Carbon::createFromTimestamp($epoch)
+                ->setTimezone(config('app.timezone'));
+            if ($ts->between(now()->subDays(30), now()->addMinutes(5))) {
+                return $ts;
+            }
+        }
+
+        return now();
+    }
 
     private function recordDoorSnapshot(int $deviceId, array $validated): void
     {

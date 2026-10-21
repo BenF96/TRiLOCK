@@ -132,4 +132,28 @@ class DoorStatusTest extends TestCase
 
         $this->assertSame('closed', $this->dashboardStatus());
     }
+
+    public function test_close_report_logs_the_device_time_and_full_open_cycle()
+    {
+        $closedAt = now()->subSeconds(20)->startOfSecond();
+
+        $this->postJson('/api/door-status', [
+            'status' => 'closed', 'device_id' => $this->main->id,
+            'occurred_at' => $closedAt->timestamp, 'open_seconds' => 12,
+        ])->assertStatus(200);
+
+        $log = DoorLog::latest('id')->first();
+        $this->assertTrue($log->closed_at->equalTo($closedAt));
+        $this->assertTrue($log->opened_at->equalTo($closedAt->copy()->subSeconds(12)));
+        $this->assertStringContainsString('(open 12s)', $log->remarks);
+    }
+
+    public function test_door_event_without_device_time_uses_server_time()
+    {
+        $this->postJson('/api/door-status', [
+            'status' => 'locked', 'device_id' => $this->main->id, 'occurred_at' => 0,
+        ])->assertStatus(200);
+
+        $this->assertTrue(DoorLog::latest('id')->first()->locked_at->diffInSeconds(now(), true) < 5);
+    }
 }

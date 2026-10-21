@@ -69,49 +69,19 @@ class DeviceAuthAndSecurityTest extends TestCase
             ]);
     }
 
-    public function test_anti_brute_force_lockout_after_five_failed_attempts()
+    public function test_repeated_failed_attempts_never_lock_out()
     {
         $token = config('trilock.device_api_key');
 
-        // First 4 failed attempts should return 403
-        for ($i = 1; $i <= 4; $i++) {
-            $response = $this->withHeaders(['X-Device-Token' => $token])
+        for ($i = 1; $i <= 10; $i++) {
+            $this->withHeaders(['X-Device-Token' => $token])
                 ->postJson('/api/access', [
                     'auth_method' => 'pin',
                     'pin_code'    => '9999',
                     'device_id'   => 2,
-                ]);
-
-            $response->assertStatus(403)
-                ->assertJson([
-                    'status' => 'denied',
-                ]);
+                ])
+                ->assertStatus(403)
+                ->assertJson(['status' => 'denied']);
         }
-
-        // 5th attempt triggers lockout and returns 429
-        $response5 = $this->withHeaders(['X-Device-Token' => $token])
-            ->postJson('/api/access', [
-                'auth_method' => 'pin',
-                'pin_code'    => '9999',
-                'device_id'   => 2,
-            ]);
-
-        $response5->assertStatus(429)
-            ->assertJson([
-                'status' => 'locked_out',
-            ]);
-
-        // Immediate subsequent attempt is still locked out
-        $responseBlocked = $this->withHeaders(['X-Device-Token' => $token])
-            ->postJson('/api/access', [
-                'auth_method' => 'pin',
-                'pin_code'    => '1234', // Even with correct PIN, device is locked
-                'device_id'   => 2,
-            ]);
-
-        $responseBlocked->assertStatus(429)
-            ->assertJson([
-                'status' => 'locked_out',
-            ]);
     }
 }

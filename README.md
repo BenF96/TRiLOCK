@@ -143,5 +143,4 @@ Notes for running this at scale:
 
 ## 🛡️ Security Features
 - **Device Token Authentication:** Hardware endpoints protected via `X-Device-Token` header.
-- **Anti-Brute Force Protection:** Automatic 60-second lockout and alarm logging after 5 consecutive failed access attempts.
 - **Hardware Task Watchdog Timers:** TWDT recovery prevents microcontroller freezes.

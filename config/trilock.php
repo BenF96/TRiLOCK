@@ -29,15 +29,6 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Security & Anti-Brute Force Lockout
-    |--------------------------------------------------------------------------
-    | Maximum consecutive failed access attempts before temporary device lockout.
-    */
-    'max_failed_attempts' => (int) env('TRILOCK_MAX_FAILED_ATTEMPTS', 5),
-    'lockout_duration'    => (int) env('TRILOCK_LOCKOUT_DURATION', 60), // seconds
-
-    /*
-    |--------------------------------------------------------------------------
     | Offline PIN Salt
     |--------------------------------------------------------------------------
     | Shared secret mixed into the fast (SHA-256) PIN hash that gets synced to
