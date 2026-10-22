@@ -709,10 +709,12 @@ void setup() {
   Serial.printf("Boot - reset reason: %d\n", (int)esp_reset_reason());
 
   // Initialize GPIO Pins
-  // Latch the locked level before switching to OUTPUT so the active-LOW relay
-  // doesn't click on (unlock) for a moment at boot
-  digitalWrite(RELAY_PIN, RELAY_RELEASE); // Solenoid Locked (De-energized)
+  // Core 3.x ignores digitalWrite() on a pin that isn't an OUTPUT yet, and
+  // pinMode(OUTPUT) drives LOW - which energizes the active-LOW relay. Set the
+  // locked level immediately after so the pin is only LOW for microseconds,
+  // far too short for the relay to pull in
   pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, RELAY_RELEASE); // Solenoid Locked (De-energized)
 
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_RED, OUTPUT);
